@@ -1,0 +1,17 @@
+presets:
+  sprite_8:
+    name: sprite_8
+    views: 8
+    resolution: 512
+    elevation_deg: 18.0
+    radius: 3.0
+    transparent_background: true
+    engine: CYCLES
+  sprite_16:
+    name: sprite_16
+    views: 16
+    resolution: 768
+    elevation_deg: 18.0
+    radius: 3.0
+    transparent_background: true
+    engine: CYCLES

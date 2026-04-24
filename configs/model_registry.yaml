@@ -1,0 +1,165 @@
+schema_version: 1
+environment_defaults:
+  production:
+    allow_unclassified: false
+    deny_restricted: true
+  research:
+    allow_unclassified: true
+    deny_restricted: false
+
+models:
+  grounded_sam2:
+    model_id: grounded_sam2
+    provider: IDEA-Research
+    task: extraction
+    license_type: Apache-2.0
+    commercial_status: allowed
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: 12
+    input_expectations: ["RGB image", "text prompt ending with '.'"]
+    output_types: ["bbox", "mask", "rgba cutout"]
+    notes: "Grounded-SAM-2 image extraction lane."
+
+  trellis2:
+    model_id: trellis2
+    provider: microsoft
+    task: image_to_3d
+    license_type: MIT
+    commercial_status: allowed
+    hero_asset_eligible: true
+    part_aware: false
+    min_vram_gb: 24
+    input_expectations: ["isolated item image"]
+    output_types: ["glb", "pbr_materials", "preview_video"]
+    notes: "Preferred hero asset provider."
+
+  trellis:
+    model_id: trellis
+    provider: microsoft
+    task: image_to_3d
+    license_type: MIT
+    commercial_status: allowed
+    hero_asset_eligible: true
+    part_aware: false
+    min_vram_gb: 16
+    input_expectations: ["isolated item image", "optionally multi-image"]
+    output_types: ["glb", "gaussian", "radiance_field", "mesh", "ply"]
+    notes: "Flexible fallback with multiple output formats."
+
+  partcrafter:
+    model_id: partcrafter
+    provider: wgsxm
+    task: image_to_3d_parts
+    license_type: MIT
+    commercial_status: allowed
+    hero_asset_eligible: false
+    part_aware: true
+    min_vram_gb: 8
+    input_expectations: ["isolated item image", "parts hint recommended"]
+    output_types: ["glb_parts", "merged_glb", "render_gif"]
+    notes: "Use for explicit part decomposition."
+
+  triposr:
+    model_id: triposr
+    provider: VAST-AI-Research
+    task: image_to_3d
+    license_type: MIT
+    commercial_status: allowed
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: 6
+    input_expectations: ["single object image"]
+    output_types: ["glb", "obj", "render_video"]
+    notes: "Fast draft lane."
+
+  instantmesh:
+    model_id: instantmesh
+    provider: TencentARC
+    task: image_to_3d
+    license_type: Apache-2.0
+    commercial_status: allowed
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: null
+    input_expectations: ["single object image"]
+    output_types: ["obj", "video"]
+    notes: "Fast draft lane with textured mesh export."
+
+  hunyuan3d_2_1:
+    model_id: hunyuan3d_2_1
+    provider: Tencent
+    task: image_to_3d
+    license_type: Tencent Hunyuan Community License
+    commercial_status: restricted
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: null
+    input_expectations: []
+    output_types: []
+    notes: "Blocked by default in production."
+
+  stable_fast_3d:
+    model_id: stable_fast_3d
+    provider: Stability AI
+    task: image_to_3d
+    license_type: Stability AI Community License
+    commercial_status: restricted
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: null
+    input_expectations: []
+    output_types: []
+    notes: "Blocked by default in production."
+
+  wonder3d:
+    model_id: wonder3d
+    provider: mvdiffusion
+    task: image_to_3d
+    license_type: AGPL-3.0
+    commercial_status: restricted
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: null
+    input_expectations: []
+    output_types: []
+    notes: "Blocked by default in production."
+
+  era3d:
+    model_id: era3d
+    provider: era3d
+    task: image_to_3d
+    license_type: AGPL-3.0
+    commercial_status: restricted
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: null
+    input_expectations: []
+    output_types: []
+    notes: "Blocked by default in production."
+
+  openlrm:
+    model_id: openlrm
+    provider: OpenLRM
+    task: image_to_3d
+    license_type: CC-BY-NC-4.0
+    commercial_status: restricted
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: null
+    input_expectations: []
+    output_types: []
+    notes: "Blocked by default in production."
+
+  mock:
+    model_id: mock
+    provider: internal
+    task: test
+    license_type: MIT
+    commercial_status: allowed
+    hero_asset_eligible: false
+    part_aware: false
+    min_vram_gb: 0
+    input_expectations: ["any image"]
+    output_types: ["obj", "png"]
+    notes: "For CI and smoke tests only."

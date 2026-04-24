@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-sprite-pipeline"
+version = "0.1.0"
+description = "Maintainable open-source image-to-3D orchestration pipeline for photoreal sprite generation."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "OpenAI GPT-5.4 Pro" }
+]
+dependencies = [
+  "Pillow>=10.0.0",
+  "PyYAML>=6.0.0",
+  "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+]
+dev = []
+
+[project.scripts]
+open-sprite-pipeline = "open_sprite_pipeline.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100

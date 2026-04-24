@@ -1,0 +1,86 @@
+app:
+  environment: production
+  artifact_root: .runs
+  temp_root: tmp
+  log_level: INFO
+  render_preset: sprite_8
+  enable_fallback_retry: true
+  review_thresholds:
+    min_frame_count: 8
+    min_coverage_mean: 0.02
+    min_sharpness_mean: 1.0
+
+registry_path: model_registry.yaml
+render_presets_path: render_presets.yaml
+
+extractor:
+  kind: simple_alpha
+  allow_fallback: true
+  simple_alpha:
+    enabled: true
+  grounded_sam2:
+    enabled: false
+    python_bin: /abs/path/.venvs/grounded_sam2/bin/python
+    sam2_checkpoint: /abs/path/vendor/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt
+    sam2_model_config: /abs/path/vendor/Grounded-SAM-2/configs/sam2.1/sam2.1_hiera_l.yaml
+    grounding_dino_config: /abs/path/vendor/Grounded-SAM-2/grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py
+    grounding_dino_checkpoint: /abs/path/vendor/Grounded-SAM-2/gdino_checkpoints/groundingdino_swint_ogc.pth
+    box_threshold: 0.35
+    text_threshold: 0.25
+    multimask_output: false
+    device: cuda
+
+normalization:
+  canvas_size: 1024
+  pad_fraction: 0.08
+  background_color: [255, 255, 255]
+  preserve_alpha: true
+  save_rgb_version: true
+
+providers:
+  trellis2:
+    enabled: false
+    python_bin: /abs/path/.venvs/trellis2/bin/python
+    model_id: microsoft/TRELLIS.2-4B
+    texture_size: 4096
+    decimation_target: 1000000
+    remesh: true
+  trellis:
+    enabled: false
+    python_bin: /abs/path/.venvs/trellis/bin/python
+    model_id: microsoft/TRELLIS-image-large
+    simplify: 0.95
+    texture_size: 1024
+  partcrafter:
+    enabled: false
+    python_bin: /abs/path/.venvs/partcrafter/bin/python
+    repo_dir: /abs/path/vendor/PartCrafter
+    guidance_scale: 7.0
+    num_inference_steps: 50
+    use_rmbg: false
+  triposr:
+    enabled: false
+    python_bin: /abs/path/.venvs/triposr/bin/python
+    repo_dir: /abs/path/vendor/TripoSR
+    texture_resolution: 2048
+    foreground_ratio: 0.85
+    bake_texture: true
+    render_video: true
+  instantmesh:
+    enabled: false
+    python_bin: /abs/path/.venvs/instantmesh/bin/python
+    repo_dir: /abs/path/vendor/InstantMesh
+    config_path: /abs/path/vendor/InstantMesh/configs/instant-mesh-large-train.yaml
+    export_texmap: true
+    save_video: true
+  mock:
+    enabled: true
+
+renderer:
+  kind: mock
+  blender:
+    enabled: false
+    blender_bin: blender
+    script_path: scripts/blender_render.py
+  mock:
+    enabled: true

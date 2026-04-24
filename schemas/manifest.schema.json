@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/open-sprite-pipeline/manifest.schema.json",
+  "title": "Open Sprite Pipeline Manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "run_dir",
+    "created_at_utc",
+    "input_image",
+    "environment",
+    "request",
+    "render_preset",
+    "items",
+    "artifact_hashes"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer" },
+    "run_id": { "type": "string" },
+    "run_dir": { "type": "string" },
+    "created_at_utc": { "type": "string" },
+    "environment": { "type": "string" },
+    "request": {
+      "type": "object",
+      "properties": {
+        "prompt": { "type": ["string", "null"] },
+        "mode": { "type": "string" },
+        "parts_hint": { "type": ["integer", "null"] },
+        "provider_override": { "type": ["string", "null"] }
+      }
+    },
+    "render_preset": { "type": "object" },
+    "input_image": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string" }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "item_id",
+          "label",
+          "status",
+          "extraction",
+          "normalization",
+          "route",
+          "generation",
+          "rendering",
+          "quality",
+          "errors"
+        ],
+        "properties": {
+          "item_id": { "type": "string" },
+          "label": { "type": "string" },
+          "status": { "type": "string" },
+          "extraction": { "type": "object" },
+          "normalization": { "type": "object" },
+          "route": { "type": "object" },
+          "generation": { "type": ["object", "null"] },
+          "rendering": { "type": ["object", "null"] },
+          "quality": { "type": ["object", "null"] },
+          "errors": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "artifact_hashes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string" }
+        }
+      }
+    }
+  }
+}
