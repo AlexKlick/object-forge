@@ -8,11 +8,19 @@ from typing import Any
 from PIL import Image
 
 from .domain import BBox, Detection
+from .health import check_executable, check_file, health_payload, reason
 from .io_utils import ensure_dir, load_json
 from .runtime import run_command
 
 
 class BaseExtractor(ABC):
+    def preflight(self) -> dict[str, Any]:
+        return health_payload(
+            component="extractor",
+            component_id=self.__class__.__name__,
+            enabled=True,
+        )
+
     @abstractmethod
     def extract(
         self,
@@ -24,6 +32,9 @@ class BaseExtractor(ABC):
 
 
 class SimpleAlphaExtractor(BaseExtractor):
+    def preflight(self) -> dict[str, Any]:
+        return health_payload("extractor", "simple_alpha", enabled=True)
+
     def extract(
         self,
         image_path: str | Path,
@@ -58,6 +69,31 @@ class GroundedSAM2Extractor(BaseExtractor):
     def __init__(self, config: dict[str, Any], project_root: str | Path) -> None:
         self.config = config
         self.project_root = Path(project_root)
+
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "Grounded-SAM-2 extractor is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("python_bin"), "python_bin"),
+                check_file(
+                    self.project_root / "backend_adapters" / "grounded_sam2_extract.py",
+                    "adapter",
+                    code="MISSING_ADAPTER",
+                ),
+                check_file(self.config.get("sam2_checkpoint"), "sam2_checkpoint"),
+                check_file(self.config.get("sam2_model_config"), "sam2_model_config"),
+                check_file(self.config.get("grounding_dino_config"), "grounding_dino_config"),
+                check_file(
+                    self.config.get("grounding_dino_checkpoint"),
+                    "grounding_dino_checkpoint",
+                ),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("extractor", "grounded_sam2", enabled, reasons)
 
     def extract(
         self,

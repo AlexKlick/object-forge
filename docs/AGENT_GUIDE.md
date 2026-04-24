@@ -8,6 +8,7 @@ An agent may safely:
 
 - load config,
 - validate registry,
+- run preflight,
 - submit a pipeline run,
 - inspect manifests,
 - inspect routing decisions,
@@ -19,6 +20,7 @@ An agent must not:
 - infer model license eligibility from memory,
 - silently swap in an unclassified provider,
 - treat missing artifacts as success,
+- treat mock artifacts as production success,
 - overwrite a finished run directory without explicit operator intent.
 
 ## Required read order for model decisions
@@ -38,6 +40,19 @@ If a model is requested but is:
 - in registry but blocked by policy → return `MODEL_BLOCKED_BY_POLICY`
 - allowed but disabled in config → return `MODEL_DISABLED`
 - enabled but not executable → return `MODEL_UNAVAILABLE`
+- mock requested outside explicit mock mode → return `MOCK_NOT_ALLOWED`
+
+## Preflight expectations
+
+Before a non-mock provider run, an agent should run:
+
+```bash
+python -m open_sprite_pipeline.cli preflight --config configs/app.example.yaml
+```
+
+Preflight success means the configured paths and executables are present. It does
+not prove model weights are correct or that inference works. A provider is only
+real-run validated after it produces non-mock assets and rendered outputs.
 
 ## Run interpretation
 

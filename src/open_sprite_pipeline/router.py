@@ -3,8 +3,20 @@ from __future__ import annotations
 from typing import Any
 
 from .domain import NormalizedItem, RouteDecision
+from .health import first_reason_code
 from .policy import classify_model_access
 from .registry import ModelRegistry
+
+
+def _provider_available(provider: Any) -> tuple[bool, str | None]:
+    if hasattr(provider, "preflight"):
+        payload = provider.preflight()
+        if payload.get("available", False):
+            return True, None
+        return False, first_reason_code(payload)
+    if provider.is_enabled():
+        return True, None
+    return False, "MODEL_DISABLED"
 
 
 def choose_provider(
@@ -37,8 +49,9 @@ def choose_provider(
         if provider is None:
             blocked[provider_id] = "PROVIDER_NOT_BUILT"
             continue
-        if not provider.is_enabled():
-            blocked[provider_id] = "MODEL_DISABLED"
+        available, blocked_reason = _provider_available(provider)
+        if not available:
+            blocked[provider_id] = blocked_reason or "MODEL_UNAVAILABLE"
             continue
         why = "provider override" if request.get("provider_override") else f"default lane for {request.get('mode', 'hero')}"
         if request.get("parts_hint", 0) and int(request["parts_hint"]) > 1:

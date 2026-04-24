@@ -31,13 +31,13 @@ def build_orchestrator(config_path: str | Path, mock: bool = False) -> PipelineO
 
     if mock:
         extractor = SimpleAlphaExtractor()
-        providers = build_providers(config, project_root=project_root)
-        providers["mock"] = MockProvider({"enabled": True})
-        renderer = MockRenderer({"enabled": True})
+        providers = build_providers(config, project_root=project_root, allow_mock=True)
+        providers["mock"] = MockProvider({"enabled": True}, allow_mock=True)
+        renderer = MockRenderer({"enabled": True}, allow_mock=True)
     else:
         extractor = build_extractor(config, project_root=project_root)
-        providers = build_providers(config, project_root=project_root)
-        renderer = build_renderer(config, project_root=project_root)
+        providers = build_providers(config, project_root=project_root, allow_mock=False)
+        renderer = build_renderer(config, project_root=project_root, allow_mock=False)
 
     normalizer = ImageNormalizer(config["normalization"])
     return PipelineOrchestrator(
@@ -75,6 +75,55 @@ def cmd_validate_registry(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_preflight_report(config_path: str | Path, mock: bool = False) -> dict:
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_config(config_path)
+    registry = ModelRegistry.load(config["registry_path"])
+    registry_problems = validate_registry_for_production(registry)
+
+    if mock:
+        extractor = SimpleAlphaExtractor()
+        providers = build_providers(config, project_root=project_root, allow_mock=True)
+        providers["mock"] = MockProvider({"enabled": True}, allow_mock=True)
+        renderer = MockRenderer({"enabled": True}, allow_mock=True)
+    else:
+        extractor = build_extractor(config, project_root=project_root)
+        providers = build_providers(config, project_root=project_root, allow_mock=False)
+        renderer = build_renderer(config, project_root=project_root, allow_mock=False)
+
+    extractor_health = extractor.preflight()
+    provider_health = {
+        provider_id: provider.preflight()
+        for provider_id, provider in providers.items()
+    }
+    renderer_health = renderer.preflight()
+    provider_available = any(payload["available"] for payload in provider_health.values())
+    ok = (
+        not registry_problems
+        and extractor_health["available"]
+        and provider_available
+        and renderer_health["available"]
+    )
+    return {
+        "ok": ok,
+        "mode": "mock" if mock else "production",
+        "registry": {
+            "ok": not registry_problems,
+            "model_count": len(registry.all_models()),
+            "problems": registry_problems,
+        },
+        "extractor": extractor_health,
+        "providers": provider_health,
+        "renderer": renderer_health,
+    }
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    report = build_preflight_report(args.config, mock=args.mock)
+    print(json.dumps(report, indent=2))
+    return 0 if report["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="open-sprite-pipeline")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -92,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
     val_parser = subparsers.add_parser("validate-registry", help="Validate the model registry.")
     val_parser.add_argument("--config", required=True, help="Path to app config YAML.")
     val_parser.set_defaults(func=cmd_validate_registry)
+
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Check configured extractor, provider, and renderer availability.",
+    )
+    preflight_parser.add_argument("--config", required=True, help="Path to app config YAML.")
+    preflight_parser.add_argument("--mock", action="store_true", help="Allow mock provider/renderer.")
+    preflight_parser.set_defaults(func=cmd_preflight)
 
     return parser
 

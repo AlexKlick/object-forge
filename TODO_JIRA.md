@@ -4,6 +4,36 @@ This file was generated from the earlier planning pass and kept as the governing
 
 ---
 
+## Current Repository Status
+
+Verified on 2026-04-24 with:
+
+- `.venv/bin/python -m unittest discover -s tests -v`
+- `.venv/bin/python -m open_sprite_pipeline.cli validate-registry --config configs/app.example.yaml`
+
+| ID | Status | Evidence / Remaining Work |
+|---|---|---|
+| I3D-EPIC-01 | Partial | Mock E2E path works; no real provider vertical slice has been validated. |
+| I3D-001 | Partial | `configs/model_registry.yaml`, `policy.py`, and registry tests exist; registry `environment_defaults` metadata still needs fuller policy enforcement. |
+| I3D-002 | Partial / blocked_pending_environment | `SimpleAlphaExtractor` works and Grounded-SAM-2 adapter exists; Grounded-SAM-2 repo/checkpoints/env are not validated. |
+| I3D-003 | Partial | Basic deterministic normalization exists in `normalization.py`; provider-specific background/stylization policy is still open. |
+| I3D-004 | Partial | Provider interface and mock tests exist; additive preflight exists, but richer prepare/run/postprocess lifecycle remains open. |
+| I3D-005 | Partial / blocked_pending_environment | TRELLIS.2 wrapper and adapter exist; no executable/checkpoint/smoke validation yet. |
+| I3D-006 | Partial / blocked_pending_environment | TRELLIS wrapper and adapter exist; no multi-image/output-mode support or smoke validation yet. |
+| I3D-007 | Partial / blocked_pending_environment | PartCrafter wrapper exists; no validated part manifests or provider smoke run. |
+| I3D-008 | Partial / blocked_pending_environment | TripoSR and InstantMesh wrappers exist; no draft metadata, promotion policy, or smoke validation. |
+| I3D-009 | Partial | Mock sprite sheet packing and Blender wrapper exist; Blender host render has not been validated with a real asset. |
+| I3D-010 | Partial | Manifest/schema alignment and artifact hashes exist; explicit schema validation command remains open. |
+| I3D-011 | Not started | Unique run IDs exist; no content-addressed cache or rerun command yet. |
+| I3D-012 | Partial | Basic QA metrics and retry/fallback exist; richer QA actions and routing policy remain open. |
+| I3D-013 | Not started | No representative benchmark harness or baseline results yet. |
+| I3D-014 | Not started | No human review/override workflow yet. |
+| I3D-015 | Partial | Local unit tests and preflight exist; CI and provider outage runbook remain open. |
+
+Real providers must remain `blocked_pending_environment` until preflight passes and a non-mock smoke run produces assets, renders, and manifest entries.
+
+---
+
 # Image-to-3D Sprite Pipeline — Jira-Style Implementation Backlog
 
 ## Executive Summary

@@ -7,6 +7,7 @@ from typing import Any
 from .artifacts import create_run_layout
 from .domain import ItemRunResult
 from .extractors import BaseExtractor
+from .health import first_reason_code
 from .manifest import write_manifest
 from .normalization import ImageNormalizer
 from .policy import classify_model_access
@@ -42,7 +43,11 @@ class PipelineOrchestrator:
         provider = self.providers.get(provider_id)
         if provider is None:
             return "PROVIDER_NOT_BUILT"
-        if not provider.is_enabled():
+        if hasattr(provider, "preflight"):
+            payload = provider.preflight()
+            if not payload.get("available", False):
+                return first_reason_code(payload)
+        elif not provider.is_enabled():
             return "MODEL_DISABLED"
         return None
 

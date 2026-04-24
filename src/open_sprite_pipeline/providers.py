@@ -8,6 +8,7 @@ from typing import Any
 from PIL import Image, ImageDraw
 
 from .domain import GeneratedAsset, NormalizedItem
+from .health import check_dir, check_executable, check_file, health_payload, reason
 from .io_utils import ensure_dir
 from .runtime import run_command
 
@@ -18,6 +19,13 @@ class BaseProvider(ABC):
     @abstractmethod
     def is_enabled(self) -> bool:
         raise NotImplementedError
+
+    def preflight(self) -> dict[str, Any]:
+        return health_payload(
+            component="provider",
+            component_id=self.provider_id,
+            enabled=self.is_enabled(),
+        )
 
     @abstractmethod
     def generate(
@@ -32,11 +40,26 @@ class BaseProvider(ABC):
 class MockProvider(BaseProvider):
     provider_id = "mock"
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], allow_mock: bool = False) -> None:
         self.config = config
+        self.allow_mock = allow_mock
 
     def is_enabled(self) -> bool:
-        return bool(self.config.get("enabled", True))
+        return bool(self.config.get("enabled", True)) and self.allow_mock
+
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", True))
+        reasons = []
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "Mock provider is disabled."))
+        if not self.allow_mock:
+            reasons.append(reason("MOCK_NOT_ALLOWED", "Mock provider requires explicit mock mode."))
+        return health_payload(
+            component="provider",
+            component_id=self.provider_id,
+            enabled=enabled,
+            reasons=reasons,
+        )
 
     def generate(
         self,
@@ -45,6 +68,8 @@ class MockProvider(BaseProvider):
         parts_hint: int | None = None,
     ) -> GeneratedAsset:
         del parts_hint
+        if not self.is_enabled():
+            raise RuntimeError("MOCK_NOT_ALLOWED: mock provider requires explicit mock mode")
         out_dir = ensure_dir(output_dir)
         obj_path = out_dir / f"{item.item_id}.obj"
         obj_path.write_text(
@@ -84,6 +109,24 @@ class Trellis2Provider(BaseProvider):
 
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
+
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "TRELLIS.2 provider is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("python_bin"), "python_bin"),
+                check_file(
+                    self.project_root / "backend_adapters" / "trellis2_generate.py",
+                    "adapter",
+                    code="MISSING_ADAPTER",
+                ),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("provider", self.provider_id, enabled, reasons)
 
     def generate(
         self,
@@ -134,6 +177,24 @@ class TrellisProvider(BaseProvider):
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
 
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "TRELLIS provider is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("python_bin"), "python_bin"),
+                check_file(
+                    self.project_root / "backend_adapters" / "trellis_generate.py",
+                    "adapter",
+                    code="MISSING_ADAPTER",
+                ),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("provider", self.provider_id, enabled, reasons)
+
     def generate(
         self,
         item: NormalizedItem,
@@ -181,6 +242,26 @@ class PartCrafterProvider(BaseProvider):
 
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
+
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        repo_dir_value = self.config.get("repo_dir")
+        repo_dir = Path(repo_dir_value) if repo_dir_value else None
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "PartCrafter provider is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("python_bin"), "python_bin"),
+                check_dir(repo_dir_value, "repo_dir"),
+                check_file(
+                    repo_dir / "scripts" / "inference_partcrafter.py" if repo_dir else None,
+                    "entrypoint",
+                ),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("provider", self.provider_id, enabled, reasons)
 
     def generate(
         self,
@@ -234,6 +315,23 @@ class TripoSRProvider(BaseProvider):
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
 
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        repo_dir_value = self.config.get("repo_dir")
+        repo_dir = Path(repo_dir_value) if repo_dir_value else None
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "TripoSR provider is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("python_bin"), "python_bin"),
+                check_dir(repo_dir_value, "repo_dir"),
+                check_file(repo_dir / "run.py" if repo_dir else None, "entrypoint"),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("provider", self.provider_id, enabled, reasons)
+
     def generate(
         self,
         item: NormalizedItem,
@@ -284,6 +382,24 @@ class InstantMeshProvider(BaseProvider):
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
 
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        repo_dir_value = self.config.get("repo_dir")
+        repo_dir = Path(repo_dir_value) if repo_dir_value else None
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "InstantMesh provider is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("python_bin"), "python_bin"),
+                check_dir(repo_dir_value, "repo_dir"),
+                check_file(repo_dir / "run.py" if repo_dir else None, "entrypoint"),
+                check_file(self.config.get("config_path"), "config_path"),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("provider", self.provider_id, enabled, reasons)
+
     def generate(
         self,
         item: NormalizedItem,
@@ -326,7 +442,11 @@ class InstantMeshProvider(BaseProvider):
         )
 
 
-def build_providers(config: dict[str, Any], project_root: str | Path) -> dict[str, BaseProvider]:
+def build_providers(
+    config: dict[str, Any],
+    project_root: str | Path,
+    allow_mock: bool = False,
+) -> dict[str, BaseProvider]:
     provider_cfg = config["providers"]
     providers: dict[str, BaseProvider] = {
         "trellis2": Trellis2Provider(provider_cfg["trellis2"], project_root=project_root),
@@ -334,6 +454,6 @@ def build_providers(config: dict[str, Any], project_root: str | Path) -> dict[st
         "partcrafter": PartCrafterProvider(provider_cfg["partcrafter"]),
         "triposr": TripoSRProvider(provider_cfg["triposr"]),
         "instantmesh": InstantMeshProvider(provider_cfg["instantmesh"]),
-        "mock": MockProvider(provider_cfg["mock"]),
+        "mock": MockProvider(provider_cfg["mock"], allow_mock=allow_mock),
     }
     return providers

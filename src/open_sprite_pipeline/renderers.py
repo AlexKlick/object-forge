@@ -7,6 +7,7 @@ from typing import Any
 from PIL import Image
 
 from .domain import GeneratedAsset, NormalizedItem, RenderedSpriteSet
+from .health import check_executable, check_file, health_payload, reason
 from .io_utils import ensure_dir
 from .runtime import run_command
 
@@ -55,6 +56,13 @@ class BaseRenderer(ABC):
     def is_enabled(self) -> bool:
         raise NotImplementedError
 
+    def preflight(self) -> dict[str, Any]:
+        return health_payload(
+            component="renderer",
+            component_id=self.__class__.__name__,
+            enabled=self.is_enabled(),
+        )
+
     @abstractmethod
     def render(
         self,
@@ -67,11 +75,21 @@ class BaseRenderer(ABC):
 
 
 class MockRenderer(BaseRenderer):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], allow_mock: bool = False) -> None:
         self.config = config
+        self.allow_mock = allow_mock
 
     def is_enabled(self) -> bool:
-        return bool(self.config.get("enabled", True))
+        return bool(self.config.get("enabled", True)) and self.allow_mock
+
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", True))
+        reasons = []
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "Mock renderer is disabled."))
+        if not self.allow_mock:
+            reasons.append(reason("MOCK_NOT_ALLOWED", "Mock renderer requires explicit mock mode."))
+        return health_payload("renderer", "mock", enabled, reasons)
 
     def render(
         self,
@@ -81,6 +99,8 @@ class MockRenderer(BaseRenderer):
         preset: dict[str, Any],
     ) -> RenderedSpriteSet:
         del asset
+        if not self.is_enabled():
+            raise RuntimeError("MOCK_NOT_ALLOWED: mock renderer requires explicit mock mode")
         out_dir = ensure_dir(output_dir)
         source = Image.open(item.normalized_rgba_path).convert("RGBA")
         frames: list[Path] = []
@@ -112,6 +132,21 @@ class BlenderRenderer(BaseRenderer):
 
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
+
+    def preflight(self) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        reasons = []
+        script_path = self.config.get("script_path")
+        if not enabled:
+            reasons.append(reason("MODEL_DISABLED", "Blender renderer is disabled."))
+        else:
+            for check in [
+                check_executable(self.config.get("blender_bin"), "blender_bin"),
+                check_file(self.project_root / script_path if script_path else None, "script_path"),
+            ]:
+                if check:
+                    reasons.append(check)
+        return health_payload("renderer", "blender", enabled, reasons)
 
     def render(
         self,
@@ -162,11 +197,15 @@ class BlenderRenderer(BaseRenderer):
         )
 
 
-def build_renderer(config: dict[str, Any], project_root: str | Path) -> BaseRenderer:
+def build_renderer(
+    config: dict[str, Any],
+    project_root: str | Path,
+    allow_mock: bool = False,
+) -> BaseRenderer:
     renderer_cfg = config["renderer"]
     kind = renderer_cfg["kind"]
     if kind == "mock":
-        return MockRenderer(renderer_cfg["mock"])
+        return MockRenderer(renderer_cfg["mock"], allow_mock=allow_mock)
     if kind == "blender":
         return BlenderRenderer(renderer_cfg["blender"], project_root=project_root)
     raise ValueError(f"Unsupported renderer kind: {kind}")

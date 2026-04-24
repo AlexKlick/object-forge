@@ -114,8 +114,18 @@ That choice makes the codebase cleaner and reduces dependency crossfire.
 ```bash
 python -m open_sprite_pipeline.cli --help
 python -m open_sprite_pipeline.cli run --help
+python -m open_sprite_pipeline.cli preflight --help
 python -m open_sprite_pipeline.cli validate-registry --help
 ```
+
+Run preflight before enabling real providers:
+
+```bash
+python -m open_sprite_pipeline.cli preflight --config configs/app.example.yaml
+```
+
+The mock path is only available when explicitly requested with `--mock`. A non-mock
+production run must not silently fall back to mock provider or mock renderer outputs.
 
 ## API
 
@@ -160,6 +170,7 @@ See `schemas/manifest.schema.json`.
 
 - The repo includes **working orchestration code** and real provider integration points, but it does **not** bundle large model weights.
 - Blender rendering is implemented as a real headless script, but not exercised in CI.
+- Real provider preflight reports missing executables, repos, adapters, and checkpoint/config paths, but it is not a substitute for a real smoke run.
 - Quality scoring is heuristic in v1. It is intended for automated routing and review flags, not final art approval.
 
 ## Next steps

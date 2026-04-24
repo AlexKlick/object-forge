@@ -22,6 +22,8 @@ def _maybe_resolve_path(key: str | None, value: Any, base_dir: Path) -> Any:
         return value
     if Path(value).is_absolute():
         return value
+    if key and key.endswith("_bin") and "/" not in value:
+        return value
     if key and key.endswith(_PATHISH_SUFFIXES):
         return str((base_dir / value).resolve())
     return value

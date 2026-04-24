@@ -81,6 +81,6 @@ renderer:
   blender:
     enabled: false
     blender_bin: blender
-    script_path: scripts/blender_render.py
+    script_path: ../scripts/blender_render.py
   mock:
     enabled: true

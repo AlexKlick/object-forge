@@ -115,9 +115,9 @@ class PipelineRoutingTests(unittest.TestCase):
                 providers={
                     "trellis2": FailingProvider(),
                     "trellis": forbidden,
-                    "mock": MockProvider({"enabled": True}),
+                    "mock": MockProvider({"enabled": True}, allow_mock=True),
                 },
-                renderer=MockRenderer({"enabled": True}),
+                renderer=MockRenderer({"enabled": True}, allow_mock=True),
                 project_root=tmp,
             )
 
@@ -142,6 +142,66 @@ class PipelineRoutingTests(unittest.TestCase):
             self.assertTrue(
                 any("trellis2: intentional provider failure" in error for error in item["errors"])
             )
+
+    def test_production_run_does_not_silently_fallback_to_mock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            image_path = tmp / "input.png"
+            image = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((32, 32, 96, 96), fill=(120, 180, 220, 255))
+            image.save(image_path)
+
+            root = Path(__file__).resolve().parents[1]
+            registry = ModelRegistry.load(str(root / "configs" / "model_registry.yaml"))
+            config = {
+                "app": {
+                    "environment": "production",
+                    "artifact_root": str(tmp / ".runs"),
+                    "enable_fallback_retry": True,
+                    "review_thresholds": {
+                        "min_frame_count": 1,
+                        "min_coverage_mean": 0.001,
+                        "min_sharpness_mean": 0.1,
+                    },
+                },
+                "_resolved_render_preset": {
+                    "name": "sprite_4",
+                    "views": 4,
+                    "resolution": 128,
+                },
+                "normalization": {
+                    "canvas_size": 128,
+                    "pad_fraction": 0.08,
+                    "background_color": [255, 255, 255],
+                    "preserve_alpha": True,
+                    "save_rgb_version": True,
+                },
+            }
+            providers = {
+                "trellis2": MockProvider({"enabled": False}, allow_mock=True),
+                "trellis": MockProvider({"enabled": False}, allow_mock=True),
+                "partcrafter": MockProvider({"enabled": False}, allow_mock=True),
+                "instantmesh": MockProvider({"enabled": False}, allow_mock=True),
+                "triposr": MockProvider({"enabled": False}, allow_mock=True),
+                "mock": MockProvider({"enabled": True}, allow_mock=False),
+            }
+            orchestrator = PipelineOrchestrator(
+                config=config,
+                registry=registry,
+                extractor=SimpleAlphaExtractor(),
+                normalizer=ImageNormalizer(config["normalization"]),
+                providers=providers,
+                renderer=MockRenderer({"enabled": True}, allow_mock=False),
+                project_root=tmp,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "MOCK_NOT_ALLOWED"):
+                orchestrator.run(
+                    image_path=image_path,
+                    prompt="toy robot.",
+                    mode="hero",
+                )
 
 
 if __name__ == "__main__":

@@ -27,6 +27,17 @@ project-root/
 
 Each provider gets its own Python executable. The orchestrator calls that executable directly.
 
+After wiring paths, run preflight before attempting generation:
+
+```bash
+python -m open_sprite_pipeline.cli preflight --config configs/app.example.yaml
+```
+
+Preflight checks enabled provider executables, adapter scripts, repo directories,
+and required config/checkpoint paths. It does not claim model inference works.
+Only a non-mock smoke run with generated assets and render outputs proves a
+provider is integrated.
+
 ## Example config fragments
 
 ### Grounded-SAM-2
