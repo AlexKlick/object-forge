@@ -111,14 +111,26 @@ def add_lights() -> None:
 
 def configure_render(output_dir: Path, resolution: int, engine: str, transparent: bool) -> None:
     scene = bpy.context.scene
-    scene.render.engine = engine
+    if engine == "CYCLES":
+        try:
+            scene.render.engine = "CYCLES"
+        except Exception:
+            scene.render.engine = "BLENDER_EEVEE"
+        else:
+            cycles = getattr(scene, "cycles", None)
+            if cycles is not None:
+                cycles.samples = 64
+                if hasattr(cycles, "use_adaptive_sampling"):
+                    cycles.use_adaptive_sampling = False
+                # Disable built-in denoising without assigning invalid denoiser enum values.
+                if hasattr(cycles, "use_denoising"):
+                    cycles.use_denoising = False
+    else:
+        scene.render.engine = engine
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.image_settings.file_format = "PNG"
     scene.render.film_transparent = transparent
-    if engine == "CYCLES":
-        scene.cycles.samples = 64
-        scene.cycles.use_adaptive_sampling = True
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
