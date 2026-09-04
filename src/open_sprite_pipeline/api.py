@@ -121,6 +121,13 @@ def create_app(
     store = UiAssetStore(resolved_ui_root, max_upload_bytes=max_upload_mb * 1024 * 1024)
 
     application = FastAPI(title="Open Sprite Pipeline", version="0.2.0")
+    if _truthy(os.getenv("FORGE_ENABLED")):
+        from .forge_api import forge_router
+        from .forge_store import ForgeStore
+
+        application.state.forge_store = ForgeStore(resolved_ui_root / "forge")
+        application.include_router(forge_router)
+
     application.state.config_path = resolved_config
     application.state.store = store
     application.state.segmenter = segmenter
