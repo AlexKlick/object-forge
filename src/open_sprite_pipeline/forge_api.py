@@ -88,6 +88,21 @@ class Progress(Payload):
 
 class Claim(Payload):
     kind: Literal["pipeline", "critic"] = "pipeline"
+    stages: list[Literal["matching", "review"]] | None = None
+
+
+class CanonicalViews(Payload):
+    canonical_views: list[str]
+    lease_id: str
+
+
+class MatchReport(Payload):
+    report: dict[str, Any]
+    lease_id: str
+
+
+class Lease(Payload):
+    lease_id: str
 
 
 class Complete(Payload):
@@ -198,6 +213,47 @@ def review(request: Request, job_id: str, body: Review):
     return store(request).review(job_id, body.mode, [p.model_dump() for p in body.panels], body.views_missing)
 
 
+@forge_router.patch("/jobs/{job_id}", dependencies=[Depends(worker_auth)])
+def canonical_views(request: Request, job_id: str, body: CanonicalViews):
+    return store(request).patch_canonical_views(job_id, body.canonical_views, body.lease_id)
+
+
+@forge_router.post("/jobs/{job_id}/match", dependencies=[Depends(worker_auth)])
+def match_report(request: Request, job_id: str, body: MatchReport):
+    return store(request).worker_match(job_id, body.report, body.lease_id)
+
+
+async def worker_image(request: Request) -> tuple[bytes, str]:
+    # Host worker owns image processing; this endpoint only stores opaque bytes.
+    payload = bytearray()
+    async for chunk in request.stream():
+        payload.extend(chunk)
+        if len(payload) > 20 * 1024 * 1024:
+            raise ForgeStoreError("Worker images are limited to 20 MiB.")
+    if not payload:
+        raise ForgeStoreError("Worker image must be nonempty.")
+    return bytes(payload), request.headers.get("X-Forge-Lease", "")
+
+
+@forge_router.post("/jobs/{job_id}/panels/{panel_id}", dependencies=[Depends(worker_auth)])
+async def save_panel(request: Request, job_id: str, panel_id: str):
+    payload, lease = await worker_image(request)
+    store(request).worker_panel(job_id, panel_id, payload, lease)
+    return {"panel_id": panel_id}
+
+
+@forge_router.post("/jobs/{job_id}/staged/views/{view}.png", dependencies=[Depends(worker_auth)])
+async def staged_view(request: Request, job_id: str, view: str):
+    payload, lease = await worker_image(request)
+    store(request).worker_staged_view(job_id, view, payload, lease)
+    return {"view": view}
+
+
+@forge_router.post("/jobs/{job_id}/staged", dependencies=[Depends(worker_auth)])
+def staged(request: Request, job_id: str, body: Lease):
+    return store(request).finish_staging(job_id, body.lease_id)
+
+
 @forge_router.post("/jobs/{job_id}/approve")
 def approve(request: Request, job_id: str):
     return store(request).set_state(job_id, "queued_bake")
@@ -210,7 +266,7 @@ def progress(request: Request, job_id: str, body: Progress):
 
 @forge_router.post("/worker/claim", dependencies=[Depends(worker_auth)])
 def claim(request: Request, body: Claim):
-    claimed = store(request).claim_job(body.kind)
+    claimed = store(request).claim_job(body.kind, body.stages)
     return claimed if claimed is not None else Response(status_code=204)
 
 

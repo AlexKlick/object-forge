@@ -249,7 +249,9 @@ class ForgeStore:
         if not isinstance(report, dict) or not isinstance(report.get("panels", []), list):
             raise ForgeStoreError("Match report must contain panel findings.")
         self._write_json(self._job_path(job_id).parent / "match" / "match_report.json", report)
-        job["match"]["panels"] = deepcopy(report.get("panels", []))
+        job["match"].update(deepcopy(report))
+        job["match"]["report_saved"] = True
+        job["match"]["submitted"] = False
         return self._save_job(job)
 
     @locked
@@ -278,6 +280,8 @@ class ForgeStore:
             raise ForgeConflict("Review decisions require a review job.")
         if mode not in {"draft", "submit"}:
             raise ForgeStoreError("Invalid review mode.")
+        if job["match"].get("submitted"):
+            raise ForgeConflict("Submitted review decisions are immutable.")
         canonical = set(job["canonical_views"])
         missing = set(self._views(views_missing))
         covered, ids = set(), set()
@@ -298,11 +302,80 @@ class ForgeStore:
             raise ForgeStoreError("Missing views must be uncovered canonical views.")
         if mode == "submit" and (not canonical or canonical - covered - missing):
             raise ForgeStoreError("Every canonical view must be covered or explicitly missing.")
+        if job["match"].get("report_saved"):
+            known = {p["panel_id"] for p in job["match"]["panels"]}
+            if ids - known or (mode == "submit" and ids != known):
+                raise ForgeStoreError("Every panel requires exactly one decision on submit.")
         job["match"]["decisions"] = deepcopy(panels)
         job["match"]["views_missing"] = sorted(missing)
         if mode == "submit":
-            job["state"] = "staged"
+            if job["match"].get("report_saved"):
+                job["match"]["submitted"] = True
+            else:  # Preserve P1 reportless/manual review clients.
+                job["state"] = "staged"
         return self._save_job(job)
+
+    def _worker_job(self, job_id: str, lease_id: str, state: str) -> dict:
+        job = self.get_job(job_id)
+        if not job["lease"] or job["state"] != state:
+            raise ForgeConflict("Worker mutation requires a claimed job in the expected state.")
+        self._check_lease(job, lease_id)
+        return job
+
+    @locked
+    def patch_canonical_views(self, job_id: str, views: list[str], lease_id: str) -> dict:
+        job = self._worker_job(job_id, lease_id, "matching")
+        views = self._views(views)
+        if not views or set(job["replacement_views"]) - set(views):
+            raise ForgeStoreError("Render views must cover replacement views and be nonempty.")
+        job["canonical_views"] = views
+        return self._save_job(job)
+
+    @locked
+    def worker_panel(self, job_id: str, panel_id: str, payload: bytes, lease_id: str) -> None:
+        self._worker_job(job_id, lease_id, "matching")
+        self.save_panel(job_id, panel_id, payload)
+
+    @locked
+    def worker_match(self, job_id: str, report: dict, lease_id: str) -> dict:
+        self._worker_job(job_id, lease_id, "matching")
+        panels = report.get("panels")
+        if not isinstance(panels, list):
+            raise ForgeStoreError("Match report requires panels.")
+        if any(not isinstance(p, dict) or "panel_id" not in p for p in panels):
+            raise ForgeStoreError("Every finding requires a panel_id.")
+        ids = [self._name(p["panel_id"]) for p in panels]
+        if len(set(ids)) != len(ids):
+            raise ForgeStoreError("Duplicate panel findings.")
+        for panel_id in ids:
+            self.panel_file(job_id, panel_id)
+        allowed = {"panels", "views_claimed", "views_missing", "extras", "rejects", "extras_allowed"}
+        if set(report) - allowed:
+            raise ForgeStoreError("Unknown match report field.")
+        self.save_match_report(job_id, report)
+        return self.set_state(job_id, "review")
+
+    @locked
+    def worker_staged_view(self, job_id: str, view: str, payload: bytes, lease_id: str) -> None:
+        job = self._worker_job(job_id, lease_id, "review")
+        accepted = {p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+        if not job["match"].get("submitted") or view not in accepted:
+            raise ForgeConflict("Staged images require submitted decisions for the view.")
+        self.save_staged_view(job_id, view, payload)
+
+    @locked
+    def finish_staging(self, job_id: str, lease_id: str) -> dict:
+        job = self._worker_job(job_id, lease_id, "review")
+        if not job["match"].get("submitted"):
+            raise ForgeConflict("Review has not been submitted.")
+        expected = {p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+        directory = self._checked(self._job_path(job_id).parent / "staged" / "views")
+        actual = {p.stem for p in directory.glob("*.png")}
+        if actual != expected:
+            raise ForgeConflict("Staged images must exactly cover submitted decisions.")
+        for view in expected:
+            self._file(directory / f"{view}.png")
+        return self.set_state(job_id, "staged")
 
     @locked
     def append_worker_log(self, job_id: str, lines: list[str]) -> None:
@@ -313,19 +386,26 @@ class ForgeStore:
         self._write_bytes(path, ("\n".join(retained) + ("\n" if retained else "")).encode("utf-8"))
 
     @locked
-    def claim_job(self, kind: str = "pipeline") -> dict | None:
+    def claim_job(self, kind: str = "pipeline", stages: list[str] | None = None) -> dict | None:
         if kind not in {"pipeline", "critic"}:
             raise ForgeStoreError("Unknown worker kind.")
         if kind == "critic":  # Reserved; critic execution is Phase 5.
             return None
         now = self._now()
         for job in self.list_jobs():
+            target = {"uploaded": "matching", "queued_bake": "baking"}.get(job["state"], job["state"])
+            if stages is not None and target not in stages:
+                continue
             lease = job["lease"]
             if lease and datetime.fromisoformat(lease["lease_expires_at"]) > now:
                 continue
             if job["state"] in {"uploaded", "queued_bake"}:
                 job["state"] = {"uploaded": "matching", "queued_bake": "baking"}[job["state"]]
-            elif not lease or job["state"] not in {"matching", "baking"}:
+            elif job["state"] == "review" and job["match"].get("submitted"):
+                pass
+            elif job["state"] == "matching":
+                pass
+            elif not lease or job["state"] != "baking":
                 continue
             job["lease"] = {"kind": kind, "lease_id": uuid4().hex,
                             "lease_expires_at": (now + timedelta(seconds=300)).isoformat()}
