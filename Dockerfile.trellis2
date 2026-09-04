@@ -1,0 +1,153 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG MINICONDA_VERSION=py311_24.11.1-0
+ARG TRELLIS2_REPO_URL=https://github.com/microsoft/TRELLIS.2.git
+ARG TRELLIS2_REF=5565d240c4a494caaf9ece7a554542b76ffa36d3
+ARG CUMESH_REPO_URL=https://github.com/JeffreyXiang/CuMesh.git
+ARG CUMESH_REF=cf1a2f07304b5fe388ed86a16e4a0474599df914
+ARG FLEXGEMM_REPO_URL=https://github.com/JeffreyXiang/FlexGEMM.git
+ARG FLEXGEMM_REF=6dd94a859c26ee8246888502eada3dd8ad85532e
+ARG NVDIFFRAST_REPO_URL=https://github.com/NVlabs/nvdiffrast.git
+ARG NVDIFFRAST_REF=253ac4fcea7de5f396371124af597e6cc957bfae
+ARG NVDIFFREC_REPO_URL=https://github.com/JeffreyXiang/nvdiffrec.git
+ARG NVDIFFREC_REF=b296927cc7fd01c2ac1087c8065c4d7248f72da4
+ARG BLENDER_VERSION=4.0.2
+ARG MAX_JOBS=2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CONDA_DIR=/opt/conda \
+    PATH=/opt/conda/bin:/usr/local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST="8.6" \
+    MAX_JOBS=${MAX_JOBS} \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    OPENCV_IO_ENABLE_OPENEXR=1 \
+    SPARSE_CONV_BACKEND=flex_gemm \
+    SPARSE_ATTN_BACKEND=flash_attn \
+    ATTN_BACKEND=flash_attn
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    ffmpeg \
+    git \
+    git-lfs \
+    libegl1 \
+    libgl1 \
+    libglib2.0-0 \
+    libjpeg-dev \
+    libomp-dev \
+    libsm6 \
+    libx11-6 \
+    libxcursor1 \
+    libxext6 \
+    libxfixes3 \
+    libxi6 \
+    libxinerama1 \
+    libxkbcommon0 \
+    libxrandr2 \
+    libxrender1 \
+    libxxf86vm1 \
+    ninja-build \
+    pkg-config \
+    wget \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-x86_64.sh" -o /tmp/miniconda.sh \
+    && bash /tmp/miniconda.sh -b -p "${CONDA_DIR}" \
+    && rm /tmp/miniconda.sh \
+    && conda clean -afy \
+    && python -m pip install --upgrade pip setuptools wheel packaging ninja
+
+RUN curl -fsSL "https://download.blender.org/release/Blender4.0/blender-${BLENDER_VERSION}-linux-x64.tar.xz" -o /tmp/blender.tar.xz \
+    && tar -xJf /tmp/blender.tar.xz -C /opt \
+    && ln -s "/opt/blender-${BLENDER_VERSION}-linux-x64/blender" /usr/local/bin/blender \
+    && rm /tmp/blender.tar.xz
+
+WORKDIR /app
+
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+COPY backend_adapters ./backend_adapters
+COPY configs ./configs
+COPY scripts ./scripts
+COPY schemas ./schemas
+
+RUN python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 \
+    && python -m pip install -e ".[api]" \
+    && python -m pip install \
+      accelerate \
+      easydict \
+      einops \
+      huggingface-hub \
+      imageio \
+      imageio-ffmpeg \
+      kornia \
+      lpips \
+      matplotlib \
+      opencv-python-headless \
+      pandas \
+      plyfile \
+      safetensors \
+      tensorboard \
+      timm \
+      tqdm \
+      transformers \
+      trimesh \
+      zstandard \
+    && python -m pip install "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
+
+RUN git clone --recursive "${TRELLIS2_REPO_URL}" /app/vendor/TRELLIS.2 \
+    && git -C /app/vendor/TRELLIS.2 checkout "${TRELLIS2_REF}" \
+    && git -C /app/vendor/TRELLIS.2 submodule update --init --recursive
+
+ENV PYTHONPATH=/app/vendor/TRELLIS.2
+
+# CuMesh requires GLIBCXX_3.4.30 which Ubuntu 22.04's system libstdc++ provides,
+# but Miniconda bundles an older libstdc++.so.6. Prepend the system library path.
+RUN echo "/usr/lib/x86_64-linux-gnu" > /etc/ld.so.conf.d/system-libs.conf \
+    && ldconfig \
+    && ldconfig -p | grep libstdc++ | head -3
+
+# CuMesh's _cumesh_xatlas extension was compiled against GLIBCXX_3.4.30 which the
+# system libstdc++ (Ubuntu 22.04) provides, but Miniconda ships an older one.
+# Replace the Miniconda symlink so all C++ extensions use the compatible system lib.
+RUN rmdir /opt/conda/lib/libstdc++.so.6 2>/dev/null || rm -f /opt/conda/lib/libstdc++.so.6; \
+    ln -s /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/conda/lib/libstdc++.so.6; \
+    ldconfig
+
+ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+
+RUN python -m pip install flash-attn==2.7.3 --no-build-isolation \
+    && mkdir -p /tmp/extensions \
+    && git clone "${NVDIFFRAST_REPO_URL}" /tmp/extensions/nvdiffrast \
+    && git -C /tmp/extensions/nvdiffrast checkout "${NVDIFFRAST_REF}" \
+    && python -m pip install /tmp/extensions/nvdiffrast --no-build-isolation \
+    && git clone "${NVDIFFREC_REPO_URL}" /tmp/extensions/nvdiffrec \
+    && git -C /tmp/extensions/nvdiffrec checkout "${NVDIFFREC_REF}" \
+    && python -m pip install /tmp/extensions/nvdiffrec --no-build-isolation \
+    && git clone --recursive "${CUMESH_REPO_URL}" /tmp/extensions/CuMesh \
+    && git -C /tmp/extensions/CuMesh checkout "${CUMESH_REF}" \
+    && git -C /tmp/extensions/CuMesh submodule update --init --recursive \
+    && python -m pip install /tmp/extensions/CuMesh --no-build-isolation \
+    && git clone --recursive "${FLEXGEMM_REPO_URL}" /tmp/extensions/FlexGEMM \
+    && git -C /tmp/extensions/FlexGEMM checkout "${FLEXGEMM_REF}" \
+    && git -C /tmp/extensions/FlexGEMM submodule update --init --recursive \
+    && python -m pip install /tmp/extensions/FlexGEMM --no-build-isolation \
+    && cp -r /app/vendor/TRELLIS.2/o-voxel /tmp/extensions/o-voxel \
+    && python -m pip install /tmp/extensions/o-voxel --no-build-isolation \
+    && rm -rf /tmp/extensions
+
+RUN mkdir -p /data/runs /data/tmp /data/outputs /cache/huggingface \
+    && python -m open_sprite_pipeline.cli validate-registry --config /app/configs/app.container.yaml
+
+EXPOSE 8050
+
+CMD ["python", "-m", "uvicorn", "open_sprite_pipeline.api:app", "--host", "0.0.0.0", "--port", "8050"]

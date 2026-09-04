@@ -109,6 +109,17 @@ TRELLIS, TRELLIS.2, Grounded-SAM-2, PartCrafter, InstantMesh, and TripoSR can al
 
 That choice makes the codebase cleaner and reduces dependency crossfire.
 
+## Managed TRELLIS.2 container
+
+The maintained real-provider lane is `deploy/docker-compose.trellis2.yml`. It builds a CUDA 12.4 image with TRELLIS.2, CuMesh, O-Voxel, Blender, and the API server wired to `configs/app.container.yaml`.
+
+```bash
+docker compose --env-file deploy/open-sprite-trellis2.env -f deploy/docker-compose.trellis2.yml config
+docker compose --env-file deploy/open-sprite-trellis2.env -f deploy/docker-compose.trellis2.yml up --build
+```
+
+This lane targets GPU 0 / RTX 3090. Do not run it concurrently with the default GPU-0 text inference lane. See [`docs/TRELLIS2_DOCKER.md`](docs/TRELLIS2_DOCKER.md).
+
 ## CLI
 
 ```bash

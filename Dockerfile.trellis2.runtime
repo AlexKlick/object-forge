@@ -1,0 +1,16 @@
+FROM open-sprite-pipeline:trellis2-cu124
+
+WORKDIR /app
+
+# Refresh only the lightweight application layer while retaining the validated
+# CUDA/TRELLIS.2 toolchain from the large base image.
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+COPY backend_adapters ./backend_adapters
+COPY configs ./configs
+COPY scripts ./scripts
+COPY schemas ./schemas
+
+RUN python -m pip install --no-cache-dir "python-multipart>=0.0.20"
+
+CMD ["python", "-m", "uvicorn", "open_sprite_pipeline.api:app", "--host", "0.0.0.0", "--port", "8050"]

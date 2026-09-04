@@ -1,0 +1,56 @@
+name: open-sprite-object-forge
+
+services:
+  object-forge:
+    build:
+      context: ..
+      dockerfile: Dockerfile.trellis2.runtime
+    image: open-sprite-pipeline:trellis2-ui-cu124
+    container_name: open-sprite-object-forge
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8050:8050"
+    environment:
+      OPEN_SPRITE_PIPELINE_CONFIG: /app/configs/app.container.yaml
+      OPEN_SPRITE_UI_ROOT: /data/runs/ui
+      OPEN_SPRITE_SEGMENTER: sam2
+      OPEN_SPRITE_SAM2_MODEL: facebook/sam2.1-hiera-tiny
+      OPEN_SPRITE_SAM2_DEVICE: cuda:1
+      OPEN_SPRITE_SAM2_LOCAL_ONLY: "true"
+      OPEN_SPRITE_SEGMENTATION_ALLOW_FALLBACK: "false"
+      OPEN_SPRITE_ALLOW_REAL_GENERATION: "true"
+      OPEN_SPRITE_GPU_QUEUE_LIMIT: "8"
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      HF_TOKEN: ${HF_TOKEN:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      OPENCV_IO_ENABLE_OPENEXR: "1"
+      SPARSE_CONV_BACKEND: flex_gemm
+      SPARSE_ATTN_BACKEND: flash_attn
+      ATTN_BACKEND: flash_attn
+      NVIDIA_VISIBLE_DEVICES: "0,1"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics,video
+      CUDA_VISIBLE_DEVICES: "0,1"
+    volumes:
+      - ../.runs/trellis2-container:/data/runs
+      - ../tmp/trellis2-container:/data/tmp
+      - ../outputs/trellis2-container:/data/outputs
+      - ../.cache/trellis2-container:/cache
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - "0"
+          - "1"
+        capabilities:
+          - gpu
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8050/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -20,9 +20,12 @@ dependencies = [
 [project.optional-dependencies]
 api = [
   "fastapi>=0.115.0",
+  "python-multipart>=0.0.20",
   "uvicorn>=0.30.0",
 ]
-dev = []
+dev = [
+  "httpx>=0.28.0",
+]
 
 [project.scripts]
 open-sprite-pipeline = "open_sprite_pipeline.cli:main"
@@ -32,6 +35,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+open_sprite_pipeline = ["web/*"]
 
 [tool.black]
 line-length = 100

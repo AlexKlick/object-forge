@@ -1,0 +1,46 @@
+name: open-sprite-trellis2
+
+services:
+  open-sprite-trellis2:
+    build:
+      context: ..
+      dockerfile: Dockerfile.trellis2
+    image: ${OPEN_SPRITE_TRELLIS2_IMAGE:-open-sprite-pipeline:trellis2-cu124}
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${OPEN_SPRITE_TRELLIS2_HOST:-127.0.0.1}:${OPEN_SPRITE_TRELLIS2_PORT:-8050}:8050"
+    environment:
+      OPEN_SPRITE_PIPELINE_CONFIG: /app/configs/app.container.yaml
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      HF_TOKEN: ${HF_TOKEN:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      OPENCV_IO_ENABLE_OPENEXR: "1"
+      SPARSE_CONV_BACKEND: flex_gemm
+      SPARSE_ATTN_BACKEND: flash_attn
+      ATTN_BACKEND: flash_attn
+      NVIDIA_VISIBLE_DEVICES: "${OPEN_SPRITE_TRELLIS2_GPU_DEVICE:-0}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics,video
+      CUDA_VISIBLE_DEVICES: "0"
+    volumes:
+      - ../${OPEN_SPRITE_TRELLIS2_DATA_ROOT:-.runs/trellis2-container}:/data/runs
+      - ../${OPEN_SPRITE_TRELLIS2_TMP_ROOT:-tmp/trellis2-container}:/data/tmp
+      - ../${OPEN_SPRITE_TRELLIS2_OUTPUT_ROOT:-outputs/trellis2-container}:/data/outputs
+      - ../${OPEN_SPRITE_TRELLIS2_CACHE_ROOT:-.cache/trellis2-container}:/cache
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - "${OPEN_SPRITE_TRELLIS2_GPU_DEVICE:-0}"
+        capabilities:
+          - gpu
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8050/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

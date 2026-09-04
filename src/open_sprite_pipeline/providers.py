@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,8 @@ class Trellis2Provider(BaseProvider):
     def __init__(self, config: dict[str, Any], project_root: str | Path) -> None:
         self.config = config
         self.project_root = Path(project_root)
+        self._env = os.environ.copy()
+        self._env["PYTHONPATH"] = str(self.project_root / "vendor" / "TRELLIS.2") + os.pathsep + self._env.get("PYTHONPATH", "")
 
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
@@ -153,7 +156,7 @@ class Trellis2Provider(BaseProvider):
         ]
         if self.config.get("remesh", True):
             command.append("--remesh")
-        run_command(command, workdir=self.project_root, log_path=out_dir / "provider.log")
+        run_command(command, workdir=self.project_root, log_path=out_dir / "provider.log", env=self._env)
         glb = out_dir / "model.glb"
         preview = out_dir / "preview.mp4"
         if not glb.exists():
@@ -173,6 +176,8 @@ class TrellisProvider(BaseProvider):
     def __init__(self, config: dict[str, Any], project_root: str | Path) -> None:
         self.config = config
         self.project_root = Path(project_root)
+        self._env = os.environ.copy()
+        self._env["PYTHONPATH"] = str(self.project_root / "vendor" / "TRELLIS.2") + os.pathsep + self._env.get("PYTHONPATH", "")
 
     def is_enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
@@ -218,7 +223,7 @@ class TrellisProvider(BaseProvider):
             "--simplify",
             str(self.config.get("simplify", 0.95)),
         ]
-        run_command(command, workdir=self.project_root, log_path=out_dir / "provider.log")
+        run_command(command, workdir=self.project_root, log_path=out_dir / "provider.log", env=self._env)
         glb = out_dir / "model.glb"
         ply = out_dir / "gaussian.ply"
         previews = [path for path in [out_dir / "preview_gs.mp4", out_dir / "preview_mesh.mp4"] if path.exists()]

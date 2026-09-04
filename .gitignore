@@ -3,9 +3,11 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+configs/app.local.yaml
 .venv/
 .venvs/
 .env
+.cache/
 .runs/
 tmp/
 outputs/
@@ -15,3 +17,7 @@ build/
 .coverage
 .pytest_cache/
 .DS_Store
+/vendor/
+/cuda-keyring_1.1-1_all.deb
+node_modules/
+/deploy/open-sprite-trellis2.env

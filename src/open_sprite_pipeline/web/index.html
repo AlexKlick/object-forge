@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Click-to-extract image objects and turn them into inspectable 3D meshes." />
+    <title>Object Forge · Open Sprite Pipeline</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/app.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Object Forge home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>Object Forge</strong><small>Open Sprite Pipeline</small></span>
+      </a>
+      <div class="runtime-state" aria-live="polite">
+        <span id="apiState" class="status-pill pending"><i></i>Connecting</span>
+        <span id="segmenterState" class="status-pill muted">Segmenter · checking</span>
+        <a class="api-link" href="/docs" target="_blank" rel="noreferrer">API docs ↗</a>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="intro">
+        <div>
+          <p class="eyebrow">Image → selection → mesh</p>
+          <h1>Pull any object<br />out of the frame.</h1>
+        </div>
+        <p class="intro-copy">
+          Upload an image, click the object you want, refine its mask, then inspect and
+          download an immediate 3D silhouette—or send the cutout into the full generation pipeline.
+        </p>
+      </section>
+
+      <section class="workflow" aria-label="Object extraction workspace">
+        <aside class="tool-panel left-panel">
+          <div class="panel-heading">
+            <span class="step-number">01</span>
+            <div><p>Source</p><h2>Choose an image</h2></div>
+          </div>
+          <label id="dropZone" class="drop-zone" for="imageInput">
+            <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp" />
+            <span class="upload-icon" aria-hidden="true">↑</span>
+            <strong>Drop an image here</strong>
+            <small>or click to browse · PNG, JPEG, WebP · 20 MB</small>
+          </label>
+          <div id="fileDetails" class="file-details empty">
+            <span>No image loaded</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="panel-heading compact">
+            <span class="step-number">02</span>
+            <div><p>Prompt</p><h2>Mark the object</h2></div>
+          </div>
+          <div class="instruction-list">
+            <div><kbd>Click</kbd><span>Include this area</span><i class="dot positive"></i></div>
+            <div><kbd>Shift + click</kbd><span>Exclude this area</span><i class="dot negative"></i></div>
+          </div>
+          <div class="button-row">
+            <button id="undoPoint" class="button secondary" type="button" disabled>Undo</button>
+            <button id="clearPoints" class="button ghost" type="button" disabled>Clear</button>
+          </div>
+          <button id="extractButton" class="button primary full" type="button" disabled>
+            <span>Extract selected object</span><b aria-hidden="true">→</b>
+          </button>
+          <p id="selectionHint" class="microcopy">Add one green point to begin.</p>
+        </aside>
+
+        <section class="image-stage-wrap">
+          <div class="stage-toolbar">
+            <div>
+              <span id="canvasLabel">Selection canvas</span>
+              <small id="canvasMeta">Waiting for an image</small>
+            </div>
+            <div class="legend"><span><i class="positive"></i>include</span><span><i class="negative"></i>exclude</span></div>
+          </div>
+          <div id="imageStage" class="image-stage empty">
+            <canvas id="selectionCanvas" aria-label="Uploaded image selection canvas"></canvas>
+            <div id="stageEmpty" class="stage-empty">
+              <span class="empty-orbit"><i></i><i></i><i></i></span>
+              <strong>Your image becomes the workspace</strong>
+              <p>Load a scene or object photo to start selecting.</p>
+            </div>
+            <div id="stageBusy" class="stage-busy hidden" role="status">
+              <span class="spinner"></span><strong>Reading your selection</strong><small>SAM2 can take a moment on CPU</small>
+            </div>
+          </div>
+        </section>
+
+        <aside class="tool-panel right-panel">
+          <div class="panel-heading">
+            <span class="step-number">03</span>
+            <div><p>Cutout</p><h2>Review extraction</h2></div>
+          </div>
+          <div id="cutoutPreview" class="cutout-preview empty">
+            <img id="cutoutImage" alt="Selected object cutout" />
+            <div><span>✦</span><p>Your extracted object will appear here.</p></div>
+          </div>
+          <div id="maskMetrics" class="metric-grid hidden">
+            <div><span>Engine</span><strong id="engineMetric">—</strong></div>
+            <div><span>Coverage</span><strong id="coverageMetric">—</strong></div>
+            <div><span>Confidence</span><strong id="confidenceMetric">—</strong></div>
+          </div>
+          <div id="fallbackNotice" class="notice warning hidden"></div>
+
+          <div class="divider"></div>
+
+          <div class="panel-heading compact">
+            <span class="step-number">04</span>
+            <div><p>Geometry</p><h2>Build the mesh</h2></div>
+          </div>
+          <label class="field-label" for="generationMode">Generation lane</label>
+          <select id="generationMode" class="select-control">
+            <option value="silhouette">Instant silhouette · available now</option>
+            <option value="pipeline-mock">Pipeline preview · mock artifacts</option>
+            <option value="pipeline-real">TRELLIS.2 · full AI mesh</option>
+          </select>
+          <div id="silhouetteControls" class="range-grid">
+            <label>Depth <output id="depthValue">0.16</output><input id="depthInput" type="range" min="0.04" max="0.5" step="0.01" value="0.16" /></label>
+            <label>Detail <output id="detailValue">72</output><input id="detailInput" type="range" min="32" max="120" step="8" value="72" /></label>
+          </div>
+          <label id="promptField" class="field-label hidden" for="generationPrompt">Object description</label>
+          <input id="generationPrompt" class="text-control hidden" type="text" placeholder="e.g. vintage brass desk lamp" />
+          <button id="generateButton" class="button accent full" type="button" disabled>
+            <span>Generate 3D mesh</span><b aria-hidden="true">✦</b>
+          </button>
+          <p id="generationBoundary" class="microcopy">Creates a textured 2.5D OBJ immediately.</p>
+        </aside>
+      </section>
+
+      <section id="resultSection" class="result-section hidden">
+        <div class="result-copy">
+          <p class="eyebrow">Mesh result</p>
+          <h2>Orbit, inspect, export.</h2>
+          <p id="resultSummary">Your generated mesh is ready.</p>
+          <div class="result-actions">
+            <a id="downloadMesh" class="button primary" href="#" download>Download mesh</a>
+            <a id="downloadMaterial" class="button secondary hidden" href="#" download>Material</a>
+            <a id="downloadTexture" class="button ghost hidden" href="#" download>Texture</a>
+          </div>
+          <div id="spriteResult" class="sprite-result hidden">
+            <span>Sprite sheet</span><img id="spriteSheet" alt="Generated sprite sheet" />
+          </div>
+        </div>
+        <div class="mesh-card">
+          <div class="mesh-toolbar"><span>Interactive preview</span><small>Drag to orbit · scroll to zoom</small></div>
+          <div id="meshViewer" class="mesh-viewer"><div class="viewer-loading">Waiting for geometry…</div></div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

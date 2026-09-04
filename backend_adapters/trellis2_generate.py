@@ -13,6 +13,7 @@ from PIL import Image
 import torch
 
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
+from trellis2.pipelines import rembg as trellis_rembg
 from trellis2.utils import render_utils
 import o_voxel
 
@@ -34,10 +35,39 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
+    with Image.open(args.image) as source_image:
+        image = source_image.copy()
+    has_transparent_alpha = (
+        image.mode == "RGBA" and image.getchannel("A").getextrema()[0] < 255
+    )
+
+    if has_transparent_alpha:
+        # The pipeline eagerly constructs its gated background-removal model even
+        # though preprocess_image never calls it for a real RGBA cutout. Avoid
+        # that unused dependency while preserving the original behavior for RGB.
+        original_rembg = trellis_rembg.BiRefNet
+        trellis_rembg.BiRefNet = lambda **_kwargs: None
+        try:
+            pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
+        finally:
+            trellis_rembg.BiRefNet = original_rembg
+        print("Using supplied alpha channel; background-removal model was not loaded.")
+    else:
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
+
+    dino_model = pipeline.image_cond_model.model
+    if not hasattr(dino_model, "layer"):
+        inner_model = getattr(dino_model, "model", None)
+        inner_layers = getattr(inner_model, "layer", None)
+        if inner_layers is None:
+            raise RuntimeError("Unsupported DINOv3 model layout: transformer layers not found")
+        # Transformers 5.x wraps the encoder under `.model`; the pinned
+        # TRELLIS.2 extractor still reads `.layer` from the outer model.
+        dino_model.__dict__["layer"] = inner_layers
+        print("Applied Transformers 5.x DINOv3 encoder compatibility mapping.")
+
     pipeline.cuda()
 
-    image = Image.open(args.image)
     mesh = pipeline.run(image)[0]
     try:
         mesh.simplify(16777216)

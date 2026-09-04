@@ -77,3 +77,17 @@ providers:
 ## Bootstrap script
 
 See `scripts/bootstrap_provider_envs.sh` for a starting point.
+
+## Dockerized TRELLIS.2 lane
+
+For the workstation-managed provider path, use the Compose lane instead of the
+local Conda environment:
+
+```bash
+docker compose --env-file deploy/open-sprite-trellis2.env -f deploy/docker-compose.trellis2.yml config
+docker compose --env-file deploy/open-sprite-trellis2.env -f deploy/docker-compose.trellis2.yml up --build
+```
+
+This path uses `configs/app.container.yaml`, exposes the API on
+`127.0.0.1:8050`, and claims GPU 0. It is intended to be started by the
+host-stack optional app service once registered there.

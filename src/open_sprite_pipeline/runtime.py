@@ -25,6 +25,7 @@ def run_command(
     command: Sequence[str],
     workdir: str | Path | None = None,
     log_path: str | Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> CommandResult:
     logging.info("Running command: %s", " ".join(command))
     completed = subprocess.run(
@@ -33,6 +34,7 @@ def run_command(
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
     result = CommandResult(
         command=list(command),
