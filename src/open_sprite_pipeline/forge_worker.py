@@ -14,6 +14,7 @@ from io import BytesIO
 import importlib
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -128,6 +129,14 @@ class ForgeWorker:
         self.assets = assets.resolve()
         self._matcher = None
         self.critic = None
+        override = os.getenv("FORGE_STORE_ROOT")
+        self._store_override = None
+        self._store_checked = False
+        if override is not None:
+            if not Path(override).is_absolute():
+                raise ValueError("FORGE_STORE_ROOT must be absolute.")
+            self._store_override = Path(override).resolve()
+            self._check_store_disjoint(self._store_override)
 
     @property
     def matcher(self):
@@ -136,10 +145,51 @@ class ForgeWorker:
         return self._matcher
 
     def store_root(self) -> Path:
+        if self._store_override is not None:
+            if not self._store_checked:
+                self._store_checked = True
+                self._check_store_identity(self._store_override)
+            return self._store_override
         root = Path(self.client.request("GET", "/status")["store_root"]).resolve()
+        self._check_store_disjoint(root)
+        return root
+
+    def _check_store_disjoint(self, root: Path):
         if root.is_relative_to(self.assets) or self.assets.is_relative_to(root):
             raise ValueError("Forge store and spike tree must be disjoint.")
-        return root
+
+    def _check_store_identity(self, root: Path):
+        # There is no generic probe-file write endpoint. Compare the API's
+        # version index with versions.json, canonicalizing transport whitespace.
+        # Never resolve, stat or open the container-reported path on the host.
+        reported = "unavailable"
+        try:
+            reported = self.client.request("GET", "/status")["store_root"]
+            pairs = self.client.request("GET", "/assets")
+            compared = 0
+            for pair in pairs:
+                asset, variant = pair["asset"], pair["variant"]
+                if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value)
+                       or ".." in value for value in (asset, variant)):
+                    raise ValueError("Invalid API store identity.")
+                remote = self.client.request("GET", f"/assets/{asset}/variants/{variant}/versions")
+                local = json.loads(checked_path(
+                    root, f"assets/{asset}/variants/{variant}/versions.json").read_bytes())
+
+                def digest(value):
+                    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                                     allow_nan=False).encode()).digest()
+
+                if digest(remote) != digest(local):
+                    raise ValueError(f"versions.json hash mismatch for {asset}/{variant}")
+                if remote:
+                    compared += 1
+            if not compared:
+                raise ValueError("No nonempty version index available for identity comparison")
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "FORGE_STORE_ROOT identity unverified (API=%s, host=%s): %s; continuing",
+                reported, root, exc)
 
     @contextmanager
     def bake_lock(self, job: dict):

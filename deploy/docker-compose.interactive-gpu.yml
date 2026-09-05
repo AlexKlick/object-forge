@@ -14,6 +14,9 @@ services:
     environment:
       OPEN_SPRITE_PIPELINE_CONFIG: /app/configs/app.container.yaml
       OPEN_SPRITE_UI_ROOT: /data/runs/ui
+      FORGE_ENABLED: "1"
+      # Set only if you also pass the same token to the host worker.
+      # FORGE_WORKER_TOKEN: ""
       OPEN_SPRITE_SEGMENTER: sam2
       OPEN_SPRITE_SAM2_MODEL: facebook/sam2.1-hiera-tiny
       OPEN_SPRITE_SAM2_DEVICE: cuda:1
