@@ -86,6 +86,20 @@ override even if this advisory check cannot establish identity.
    `store_root: /data/runs/ui/forge`. A health response alone does not prove
    Forge is enabled. Check host ownership/read-write access on the bind mount.
 
+3b. **FIRST BOOT / RECREATE ONLY — fix store ownership.** The container runs
+   as root, so the forge store it creates under the bind mount is root-owned
+   and the host worker (running as your user) gets `PermissionError` on
+   `<store>/locks`. After the first request that materializes the store (or
+   preemptively after any recreate that wipes it), chown it from inside the
+   container — no host sudo needed:
+
+   ```bash
+   docker exec open-sprite-object-forge chown -R 1000:1000 /data/runs/ui/forge
+   ```
+
+   Symptom if skipped: the worker log repeats
+   `PermissionError: ... /ui/forge/locks` and bake jobs sit in `queued_bake`.
+
 4. Start **one** host worker. The repo `.venv` needs the existing project/API
    dependencies; the bake interpreter and Blender must already support the
    spike toolchain. These commands do not install anything:
