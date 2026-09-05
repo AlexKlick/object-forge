@@ -1,4 +1,4 @@
-"""Host-only MATCH worker. All durable writes go through the Forge HTTP API.
+"""Host-only MATCH and bake worker. Job/version state uses the Forge HTTP API.
 
 The spike's pure image helpers are imported with bytecode writes disabled;
 never call its run/main functions, which write beneath the spike assets tree.
@@ -6,6 +6,10 @@ never call its run/main functions, which write beneath the spike assets tree.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import Counter
+import base64
+import fcntl
+import hashlib
 from io import BytesIO
 import importlib
 import ipaddress
@@ -13,6 +17,10 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import shlex
+import signal
+import subprocess
 import sys
 from threading import Event, Thread
 import time
@@ -21,6 +29,30 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 DEFAULT_SPIKE_ASSETS = Path("/home/alexk/debt-city-greybox-spike/apps/greybox/assets")
+BAKE_MARKERS = re.compile(r"\b(?:PROJECT|SELFCHECK|VIEW-VALIDATE|TURNTABLE|BAKE|VERIFY)\b")
+
+
+def checked_path(root: Path, relative: str | Path) -> Path:
+    """Reject aliases before any transient write or artifact read."""
+    path = root / relative
+    if not path.is_relative_to(root) or ".." in path.parts:
+        raise ValueError("Path escapes worker root.")
+    for component in (path, *path.parents):
+        if component == root:
+            break
+        if component.is_symlink():
+            raise ValueError(f"Symlink forbidden: {component}")
+    if path.is_file() and path.stat().st_nlink != 1:
+        raise ValueError(f"Hardlink forbidden: {path}")
+    return path
+
+
+def fingerprint(path: Path):
+    try:
+        stat = path.stat()
+        return stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    except FileNotFoundError:
+        return None
 
 
 def truthy(value: str) -> bool:
@@ -94,7 +126,223 @@ class ForgeWorker:
     def __init__(self, client: ForgeClient, assets: Path):
         self.client = client
         self.assets = assets.resolve()
-        self.matcher = load_matcher(self.assets)
+        self._matcher = None
+
+    @property
+    def matcher(self):
+        if self._matcher is None:
+            self._matcher = load_matcher(self.assets)
+        return self._matcher
+
+    def store_root(self) -> Path:
+        root = Path(self.client.request("GET", "/status")["store_root"]).resolve()
+        if root.is_relative_to(self.assets) or self.assets.is_relative_to(root):
+            raise ValueError("Forge store and spike tree must be disjoint.")
+        return root
+
+    @contextmanager
+    def bake_lock(self, job: dict):
+        root = self.store_root()
+        path = checked_path(root, f"locks/{job['asset']}__{job['variant']}.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+b") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield None
+                return
+            try:
+                yield root
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def run_next(self):
+        job = self.client.request("POST", "/worker/claim", {
+            "kind": "pipeline", "stages": ["matching", "review"]})
+        if job is not None:
+            return self.process(job)
+        for candidate in self.client.request("GET", "/jobs"):
+            if candidate["state"] not in {"queued_bake", "baking"}:
+                continue
+            # Lock BEFORE claiming: a competing process leaves its job queued.
+            with self.bake_lock(candidate) as root:
+                if root is None:
+                    continue
+                job = self.client.request("POST", "/worker/claim", {
+                    "kind": "pipeline", "stages": ["baking"], "job_id": candidate["id"]})
+                if job is not None:
+                    return self.process(job, bake_root=root)
+        return None
+
+    def bake_command(self, job: dict) -> list[str]:
+        override = os.getenv("FORGE_BAKE_CMD")
+        if override:
+            return shlex.split(override)
+        command = [os.getenv("FORGE_BAKE_PYTHON", "/home/alexk/.venv/bin/python"),
+                   str(checked_path(self.assets, "tools/bake.py")),
+                   "--asset", job["asset"], "--variant", job["variant"]]
+        for key in ("atlas_tile", "turntable", "ownership_min", "view_iou_warn", "view_iou_fail"):
+            if job["params"][key]:
+                command.extend(["--" + key.replace("_", "-"), str(job["params"][key])])
+        return command
+
+    def restore_snapshot(self, backup: Path, views: Path, plan: Path):
+        manifest = json.loads(checked_path(backup, "snapshot.json").read_bytes())
+        if manifest["spike_assets"] != str(self.assets):
+            raise ValueError("Snapshot belongs to a different spike tree.")
+        # Verify every backup before changing either spike location.
+        copies = {}
+        for name, digest in manifest["files"].items():
+            data = checked_path(backup, name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ValueError(f"Snapshot hash mismatch: {name}")
+            copies[name] = data
+        for path in views.glob("*.png"):
+            checked_path(self.assets, path.relative_to(self.assets)).unlink()
+        for name, data in copies.items():
+            if name.startswith("views/"):
+                checked_path(self.assets, views.relative_to(self.assets) / Path(name).name).write_bytes(data)
+        checked_path(self.assets, plan.relative_to(self.assets))
+        if manifest["plan_existed"]:
+            plan.write_bytes(copies["build_plan.json"])
+        else:
+            plan.unlink(missing_ok=True)
+        if not manifest["views_existed"] and views.exists():
+            views.rmdir()
+        actual = {f"views/{p.name}": hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in views.glob("*.png")}
+        if plan.exists():
+            actual["build_plan.json"] = hashlib.sha256(plan.read_bytes()).hexdigest()
+        if actual != manifest["files"]:
+            raise ValueError("Restored snapshot differs from saved names/hashes.")
+        manifest["restored"] = True
+        checked_path(backup, "snapshot.json").write_text(json.dumps(manifest, indent=2))
+
+    @contextmanager
+    def staged_snapshot(self, job: dict, root: Path):
+        pair = Path(job["asset"]) / job["variant"]
+        views = checked_path(self.assets, Path("styled") / pair / "views")
+        plan = checked_path(self.assets, Path("blockouts") / pair / "build_plan.json")
+        jobs = checked_path(root, Path("assets") / job["asset"] / "variants" / job["variant"] / "jobs")
+        # Recover a worker crash before a later job can snapshot abandoned views.
+        for retained in sorted(jobs.glob("*/views_backup/snapshot.json")):
+            retained = checked_path(root, retained.relative_to(root))
+            if not json.loads(retained.read_bytes())["restored"]:
+                self.restore_snapshot(retained.parent, views, plan)
+                self.progress(job, f"RESTORE recovered {retained.parent.parent.name}")
+        backup = checked_path(root, jobs.relative_to(root) / job["id"] / "views_backup")
+        backup.mkdir(parents=True, exist_ok=True)
+        manifest = {"spike_assets": str(self.assets),
+                    "views_existed": views.exists(), "plan_existed": plan.exists(),
+                    "files": {}, "restored": False}
+        paths = sorted(views.glob("*.png")) + ([plan] if plan.exists() else [])
+        for path in paths:
+            data = checked_path(self.assets, path.relative_to(self.assets)).read_bytes()
+            name = "build_plan.json" if path == plan else f"views/{path.name}"
+            target = checked_path(root, backup.relative_to(root) / name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            manifest["files"][name] = hashlib.sha256(data).hexdigest()
+        checked_path(root, backup.relative_to(root) / "snapshot.json").write_text(json.dumps(manifest, indent=2))
+        try:
+            views.mkdir(parents=True, exist_ok=True)
+            staged = sorted(p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject")
+            if not staged:
+                raise ValueError("Bake requires staged views.")
+            # Fetch all input bytes before mutating the shared drop zone.
+            payloads = {view: self.client.request("GET", f"/jobs/{job['id']}/staged/views/{view}.png")
+                        for view in staged}
+            for path in views.glob("*.png"):
+                checked_path(self.assets, path.relative_to(self.assets)).unlink()
+            for view, data in payloads.items():
+                checked_path(self.assets, views.relative_to(self.assets) / f"{view}.png").write_bytes(data)
+            yield backup
+        finally:
+            self.restore_snapshot(backup, views, plan)
+            self.progress(job, "RESTORE views and build_plan snapshot verified")
+
+    def execute_bake(self, job: dict, backup: Path):
+        output = checked_path(self.assets, Path("bakes") / job["asset"] / job["variant"])
+        # The fixed-path tool also writes here; reject aliases before launching it.
+        for path in output.rglob("*"):
+            checked_path(self.assets, path.relative_to(self.assets))
+        log = checked_path(self.assets, output.relative_to(self.assets) / "blender.log")
+        previous = {p.relative_to(output).as_posix(): fingerprint(p) for p in output.rglob("*") if p.is_file()}
+        seen = ""
+        pending = ""
+
+        def tail(final=False):
+            nonlocal seen, pending
+            if fingerprint(log) == previous.get("blender.log") or not log.exists():
+                return
+            checked_path(self.assets, log.relative_to(self.assets))
+            content = log.read_text(errors="replace")
+            if not content.startswith(seen):
+                seen, pending = "", ""
+            pending += content[len(seen):]
+            seen = content
+            lines = pending.split("\n")
+            pending = lines.pop()
+            if final and pending:
+                lines.append(pending)
+                pending = ""
+            for line in lines:
+                if BAKE_MARKERS.search(line):
+                    self.progress(job, line)
+
+        # bake.py owns Blender's PYTHONHOME/PYTHONPATH. Only suppress bytecode.
+        with checked_path(backup, "bake-command.log").open("wb") as stdout:
+            process = subprocess.Popen(self.bake_command(job), stdout=stdout, stderr=subprocess.STDOUT,
+                                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, start_new_session=True)
+            try:
+                while process.poll() is None:
+                    tail()
+                    time.sleep(0.05)
+                tail(final=True)
+                self.progress(job, f"BLENDER exited rc={process.returncode}")
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+        if process.returncode != 0 or "BAKE " not in seen:
+            raise ValueError(f"Bake failed: rc={process.returncode}; fresh BAKE marker={'BAKE ' in seen}")
+        names = [f"{job['asset']}_{job['variant']}.glb", "atlas.png", "bake_report.json",
+                 "harmonize_report.json", "blender.log"]
+        frames = []
+        if job["params"]["turntable"]:
+            frames = [f"turntable/tt_{i:02d}.png" for i in range(job["params"]["turntable"])]
+        artifacts = {}
+        raw = {}
+        for name in names + frames:
+            path = checked_path(self.assets, output.relative_to(self.assets) / name)
+            if fingerprint(path) is None or fingerprint(path) == previous.get(name):
+                raise ValueError(f"Missing or stale bake artifact: {name}")
+            raw[name] = path.read_bytes()
+            artifacts[name] = {"encoding": "base64", "data": base64.b64encode(raw[name]).decode("ascii")}
+        report = json.loads(raw["bake_report.json"])
+        harmonize = json.loads(raw["harmonize_report.json"])
+        if (report["asset"], report["variant"]) != (job["asset"], job["variant"]):
+            raise ValueError("Bake report identity differs from job.")
+        metrics = {key: report[key] for key in ("coverage", "bleed_avoided", "bleed_faces", "fallback_split")}
+        metrics.update(parts_total=len(report["parts"]),
+                       part_layers=dict(Counter(part["layer"] for part in report["parts"])),
+                       harmonize_drift={view["view"]: view["drift_mean"] for view in harmonize["views"]},
+                       turntable_frames=len(frames))
+        # The installed tool emits selfcheck only in blender.log, not its JSON.
+        if "selfcheck" in report:
+            metrics["selfcheck"] = report["selfcheck"]
+        else:
+            source = checked_path(self.assets, "tools/bake_views.py").read_text()
+            threshold = re.search(r"^SELFCHECK_THRESHOLD\s*=\s*([0-9.]+)", source, re.M)
+            if threshold is None:
+                raise ValueError("Cannot determine bake selfcheck threshold.")
+            metrics["selfcheck"] = {"threshold": float(threshold[1]), "views": {
+                view: float(iou) for view, iou in re.findall(r"SELFCHECK (\S+) silhouette IoU=([0-9.]+)", seen)}}
+        return artifacts, metrics
 
     def progress(self, job: dict, *markers: str, **fields):
         for marker in markers:
@@ -201,7 +449,34 @@ class ForgeWorker:
                                 lease=job["lease"]["lease_id"])
             self.progress(job, f"VIEW {view} iou={score:.4f} staged decision={decision['decision']}")
 
-    def process(self, job: dict):
+    def process(self, job: dict, *, bake_root: Path | None = None):
+        if job["state"] == "baking" and bake_root is None:
+            with self.bake_lock(job) as root:
+                if root is None:
+                    return None
+                return self.process(job, bake_root=root)
+        try:
+            if job["state"] != "baking":
+                return self.process_match(job)
+            with self.heartbeats(job):
+                self.progress(job, f"START baking job={job['id']}")
+                with self.staged_snapshot(job, bake_root) as backup:
+                    artifacts, metrics = self.execute_bake(job, backup)
+            version = self.client.request("POST", "/worker/complete", {
+                "job_id": job["id"], "lease_id": job["lease"]["lease_id"],
+                "artifacts": artifacts, "metrics": metrics})
+            print(f"DONE ready job={job['id']} version=v{version['number']}", flush=True)
+            return self.client.request("GET", f"/jobs/{job['id']}")
+        except BaseException as exc:
+            try:
+                fields = ({"state": "failed"} if job["state"] == "baking"
+                          or not isinstance(exc, (HTTPError, URLError, OSError)) else {})
+                self.progress(job, f"ERROR {type(exc).__name__}: {exc}", error=str(exc), **fields)
+            except Exception as report_error:
+                print(f"ERROR reporting failure: {report_error}", file=sys.stderr, flush=True)
+            raise
+
+    def process_match(self, job: dict):
         if job["state"] not in {"matching", "review"}:
             raise ValueError("MATCH worker cannot process this state.")
         if job["state"] == "review" and not job["match"].get("submitted"):
@@ -224,6 +499,10 @@ class ForgeWorker:
 
 
 def main() -> int:
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f"Worker received signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupted)
     once = truthy(os.getenv("FORGE_ONCE", ""))
     interval = float(os.getenv("FORGE_POLL_INTERVAL", "2"))
     if not math.isfinite(interval) or interval <= 0:
@@ -231,11 +510,9 @@ def main() -> int:
     client = ForgeClient(os.getenv("FORGE_API", "http://127.0.0.1:8070"), os.getenv("FORGE_WORKER_TOKEN", ""))
     worker = ForgeWorker(client, Path(os.getenv("FORGE_SPIKE_ASSETS", str(DEFAULT_SPIKE_ASSETS))))
     while True:
-        job = None
         try:
-            job = client.request("POST", "/worker/claim", {"kind": "pipeline", "stages": ["matching", "review"]})
-            if job is not None:
-                worker.process(job)
+            result = worker.run_next()
+            if result is not None:
                 if once:
                     return 0
             elif once:
@@ -245,13 +522,6 @@ def main() -> int:
                 time.sleep(interval)
         except Exception as exc:
             print(f"ERROR {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-            if job is not None:
-                try:
-                    # Transport/process failures retain state for lease-expiry retry.
-                    fields = {} if isinstance(exc, (HTTPError, URLError, OSError)) else {"state": "failed"}
-                    worker.progress(job, f"ERROR {type(exc).__name__}: {exc}", error=str(exc), **fields)
-                except Exception as report_error:
-                    print(f"ERROR reporting failure: {report_error}", file=sys.stderr, flush=True)
             if once:
                 return 1
             time.sleep(interval)

@@ -312,8 +312,8 @@ class ForgeWorkerTests(unittest.TestCase):
         self.assertTrue(job["match"]["extras_allowed"])
         self.assertEqual(job["match"]["views_missing"], [])
 
-    def test_worker_does_not_claim_bake_or_later_states(self):
-        for target in ("staged", "queued_bake", "baking", "ready"):
+    def test_worker_does_not_claim_unapproved_or_terminal_states(self):
+        for target in ("staged", "ready"):
             job = self.store.create_job("testa", "v1")
             for state in ("matching", "review", "staged", "queued_bake", "baking", "ready"):
                 self.store.set_state(job["id"], state)

@@ -135,8 +135,9 @@ class ForgeStore:
         if type(values["allow_extra"]) is not bool:
             raise ForgeStoreError("allow_extra must be a boolean.")
         for key in ("atlas_tile", "turntable"):
-            if type(values[key]) is not int or values[key] < 1:
-                raise ForgeStoreError(f"{key} must be a positive integer.")
+            minimum = 0 if key == "turntable" else 1
+            if type(values[key]) is not int or values[key] < minimum:
+                raise ForgeStoreError(f"{key} must be an integer >= {minimum}.")
         return values
 
     def _views(self, values: list) -> list[str]:
@@ -363,6 +364,9 @@ class ForgeStore:
             raise ForgeConflict("Staged images require submitted decisions for the view.")
         self.save_staged_view(job_id, view, payload)
 
+    def staged_view_file(self, job_id: str, view: str) -> Path:
+        return self._file(self._job_path(job_id).parent / "staged" / "views" / f"{self._name(view)}.png")
+
     @locked
     def finish_staging(self, job_id: str, lease_id: str) -> dict:
         job = self._worker_job(job_id, lease_id, "review")
@@ -386,18 +390,29 @@ class ForgeStore:
         self._write_bytes(path, ("\n".join(retained) + ("\n" if retained else "")).encode("utf-8"))
 
     @locked
-    def claim_job(self, kind: str = "pipeline", stages: list[str] | None = None) -> dict | None:
+    def claim_job(self, kind: str = "pipeline", stages: list[str] | None = None,
+                  job_id: str | None = None) -> dict | None:
         if kind not in {"pipeline", "critic"}:
             raise ForgeStoreError("Unknown worker kind.")
         if kind == "critic":  # Reserved; critic execution is Phase 5.
             return None
         now = self._now()
-        for job in self.list_jobs():
+        jobs = self.list_jobs()
+        for job in jobs:
+            if job_id is not None and job["id"] != job_id:
+                continue
             target = {"uploaded": "matching", "queued_bake": "baking"}.get(job["state"], job["state"])
             if stages is not None and target not in stages:
                 continue
             lease = job["lease"]
             if lease and datetime.fromisoformat(lease["lease_expires_at"]) > now:
+                continue
+            if target == "baking" and any(
+                    other["id"] != job["id"] and other["state"] == "baking"
+                    and (other["asset"], other["variant"]) == (job["asset"], job["variant"])
+                    and other["lease"]
+                    and datetime.fromisoformat(other["lease"]["lease_expires_at"]) > now
+                    for other in jobs):
                 continue
             if job["state"] in {"uploaded", "queued_bake"}:
                 job["state"] = {"uploaded": "matching", "queued_bake": "baking"}[job["state"]]
@@ -494,6 +509,8 @@ class ForgeStore:
             "lineage": {"parent_version": job["parent_version"],
                         "root_version": parent["lineage"]["root_version"] if parent else number},
             "inputs": {"uploads": deepcopy(job["uploads"]),
+                       "staged_views": sorted(p.stem for p in self._checked(
+                           self._job_path(job_id).parent / "staged" / "views").glob("*.png")),
                        "replacement_views": job["replacement_views"],
                        "parent_views_inherited": [v for v in job["canonical_views"]
                                                   if parent and v not in job["replacement_views"]]},
@@ -508,14 +525,16 @@ class ForgeStore:
                 raise ForgeStoreError("Artifact paths must be distinct files.")
             if name.endswith(".json"):
                 if isinstance(value, bytes):
-                    value = json.loads(value)
+                    # Validate JSON without changing harvested source bytes.
+                    json.dumps(json.loads(value), allow_nan=False)
                 elif isinstance(value, str):
                     value = json.loads(value)
-                value = json.dumps(value, allow_nan=False, indent=2).encode("utf-8")
+                if not isinstance(value, bytes):
+                    value = json.dumps(value, allow_nan=False, indent=2).encode("utf-8")
             elif not isinstance(value, bytes):
                 value = value.encode("utf-8") if isinstance(value, str) else json.dumps(value, allow_nan=False).encode("utf-8")
-            if len(value) > 4 * 1024 * 1024:
-                raise ForgeStoreError("Each completion artifact is limited to 4 MiB.")
+            if len(value) > 32 * 1024 * 1024:
+                raise ForgeStoreError("Each completion artifact is limited to 32 MiB.")
             prepared[relative] = value
         # Publish an entire version at once; failed writes never consume a number.
         pending = self._checked(directory.with_name(f".pending-{uuid4().hex}"))

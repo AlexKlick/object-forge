@@ -41,7 +41,7 @@ class ForgeStoreTests(unittest.TestCase):
 
     def test_bad_params_and_identifiers(self):
         for params in ({"iou": float("nan")}, {"margin": -1}, {"atlas_tile": True},
-                       {"allow_extra": 1}, {"unknown": 3}, {"turntable": 0}, []):
+                       {"allow_extra": 1}, {"unknown": 3}, {"turntable": -1}, []):
             with self.subTest(params=params), self.assertRaises(ForgeStoreError):
                 self.job(params=params)
         for asset in ("..", "../escape", "/absolute", "bad/name"):

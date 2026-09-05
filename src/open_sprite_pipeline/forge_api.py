@@ -88,7 +88,8 @@ class Progress(Payload):
 
 class Claim(Payload):
     kind: Literal["pipeline", "critic"] = "pipeline"
-    stages: list[Literal["matching", "review"]] | None = None
+    stages: list[Literal["matching", "review", "baking"]] | None = None
+    job_id: str | None = None
 
 
 class CanonicalViews(Payload):
@@ -249,6 +250,12 @@ async def staged_view(request: Request, job_id: str, view: str):
     return {"view": view}
 
 
+@forge_router.get("/jobs/{job_id}/staged/views/{view}.png", dependencies=[Depends(worker_auth)])
+def read_staged_view(request: Request, job_id: str, view: str):
+    target = store(request)
+    return FileResponse(target.staged_view_file(job_id, view), media_type="image/png")
+
+
 @forge_router.post("/jobs/{job_id}/staged", dependencies=[Depends(worker_auth)])
 def staged(request: Request, job_id: str, body: Lease):
     return store(request).finish_staging(job_id, body.lease_id)
@@ -266,7 +273,7 @@ def progress(request: Request, job_id: str, body: Progress):
 
 @forge_router.post("/worker/claim", dependencies=[Depends(worker_auth)])
 def claim(request: Request, body: Claim):
-    claimed = store(request).claim_job(body.kind, body.stages)
+    claimed = store(request).claim_job(body.kind, body.stages, body.job_id)
     return claimed if claimed is not None else Response(status_code=204)
 
 
@@ -284,8 +291,8 @@ def complete(request: Request, body: Complete):
                 raise ForgeStoreError("Invalid base64 artifact.") from exc
         size = len(value) if isinstance(value, bytes) else len(json.dumps(value, allow_nan=False).encode())
         total += size
-        if total > 8 * 1024 * 1024:
-            raise ForgeStoreError("Completion artifacts are limited to 8 MiB total.")
+        if total > 64 * 1024 * 1024:
+            raise ForgeStoreError("Completion artifacts are limited to 64 MiB total.")
         artifacts[name] = value
     return store(request).complete(body.job_id, artifacts=artifacts, metrics=body.metrics, lease_id=body.lease_id)
 
