@@ -153,6 +153,67 @@ class ForgeBakeTests(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
 
+    def test_iterate_params_without_uploads_stages_and_bakes_lineage(self):
+        parent = self.staged()
+        self.approve(parent)
+        self.assertEqual(self.worker.run_next()["state"], "ready")
+        response = self.http.post("/v1/forge/jobs", data={"asset": "a", "variant": "v",
+            "intent": "iterate_params", "parent_job": parent["id"], "parent_version": "1",
+            "params": json.dumps({"turntable": 1, "iou": .8})})
+        self.assertEqual(response.status_code, 201, response.text)
+        child = response.json()
+        # There are no render masks or matcher helpers in this fake bake fixture.
+        # A successful stage proves the no-upload path did not invoke matching.
+        staged = self.worker.run_next()
+        self.assertEqual(staged["state"], "staged")
+        self.assertEqual(staged["uploads"], [])
+        self.assertEqual(staged["match"]["decisions"], [])
+        self.assertEqual(staged["inputs"]["parent_views_inherited"], ["front"])
+        self.assertEqual(self.store.staged_view_file(child["id"], "front").read_bytes(), b"staged front")
+        self.approve(staged)
+        self.assertEqual(self.worker.run_next()["state"], "ready")
+        version = self.client.request("GET", "/assets/a/variants/v/versions/2")
+        self.assertEqual(version["lineage"], {"parent_version": 1, "root_version": 1})
+        self.assertEqual(version["inputs"]["parent_views_inherited"], ["front"])
+        self.assertEqual(version["inputs"]["staged_views"], ["front"])
+        self.assertEqual(self.client.request("GET", "/library")[1]["lineage"], version["lineage"])
+        self.assert_restored(child)
+        # A grandchild keeps the original root instead of resetting it to v2.
+        response = self.http.post("/v1/forge/jobs", data={"asset": "a", "variant": "v",
+            "intent": "iterate_params", "parent_job": child["id"], "parent_version": "2",
+            "params": '{"turntable":1}'})
+        self.assertEqual(response.status_code, 201, response.text)
+        grandchild = self.worker.run_next()
+        self.approve(grandchild)
+        self.worker.run_next()
+        self.assertEqual(self.store.get_version("a", "v", 3)["lineage"],
+                         {"parent_version": 2, "root_version": 1})
+
+    def test_version_detail_part_layer_map_and_worker_log(self):
+        job = self.staged()
+        self.approve(job)
+        self.script.write_text(FAKE.replace('{"layer": "core"}', '{"id": "wall", "layer": "core"}', 1)
+                               .replace('{"layer": "social"}', '{"id": "banner", "layer": "social"}'))
+        self.worker.run_next()
+        version = self.client.request("GET", "/assets/a/variants/v/versions/1")
+        self.assertEqual(version["part_layer_map"], {"wall": "core", "banner": "social"})
+        self.assertIn("a_v.glb", version["artifacts"])
+        self.assertIn("turntable/tt_00.png", version["artifacts"])
+        record = self.client.request("GET", f"/jobs/{job['id']}")
+        self.assertTrue(any("BAKE a_v.glb" in line for line in record["worker_log"]))
+
+    def test_iteration_rejects_missing_or_mismatched_parent(self):
+        parent = self.staged()
+        self.approve(parent)
+        self.worker.run_next()
+        fields = {"asset": "a", "variant": "v", "intent": "iterate_params",
+                  "parent_job": parent["id"], "parent_version": "1"}
+        for changes in ({"parent_version": "99"}, {"parent_job": "0" * 32},
+                        {"variant": "other"}, {"canonical_views": '["other"]'}):
+            response = self.http.post("/v1/forge/jobs", data={**fields, **changes})
+            self.assertIn(response.status_code, (404, 422), response.text)
+        self.assertEqual(len(self.store.list_jobs()), 1)
+
     def test_happy_path_version_metrics_artifact_bytes_and_snapshot(self):
         job = self.staged()
         self.assertIsNone(self.worker.run_next())

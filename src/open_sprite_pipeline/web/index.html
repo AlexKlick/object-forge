@@ -31,7 +31,13 @@
       </div>
     </header>
 
+    <nav class="main-tabs shell" role="tablist" aria-label="Workspaces">
+      <button type="button" role="tab" data-main-tab="capture" aria-selected="true" aria-controls="capturePanel">Capture</button>
+      <button type="button" role="tab" data-main-tab="forge" aria-selected="false" aria-controls="forgePanel">Bake Forge</button>
+      <button type="button" role="tab" data-main-tab="library" aria-selected="false" aria-controls="libraryWorkspace">Library</button>
+    </nav>
     <main class="shell">
+      <div id="capturePanel" data-main-panel="capture" role="tabpanel">
       <section class="intro">
         <div>
           <p class="eyebrow">Image → selection → mesh</p>
@@ -160,9 +166,17 @@
           <div id="meshViewer" class="mesh-viewer"><div class="viewer-loading">Waiting for geometry…</div></div>
         </div>
       </section>
+      </div>
+      <section id="forgePanel" data-main-panel="forge" role="tabpanel" hidden></section>
+      <section id="libraryWorkspace" data-main-panel="library" role="tabpanel" hidden>
+        <div id="libraryPanel"></div>
+        <section id="versionDetail" class="forge-surface" hidden></section>
+      </section>
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/assets/viewer.js"></script>
     <script type="module" src="/assets/app.js"></script>
+    <script type="module" src="/assets/forge.js"></script>
   </body>
 </html>

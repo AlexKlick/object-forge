@@ -136,7 +136,8 @@ def assets(request: Request):
 async def create_job(request: Request):
     async with request.form(max_files=8, max_fields=16) as form:
         files = form.getlist("files") + form.getlist("files[]")
-        if not 1 <= len(files) <= 8 or not all(isinstance(f, UploadFile) for f in files):
+        minimum = 0 if form.get("intent") == "iterate_params" else 1
+        if not minimum <= len(files) <= 8 or not all(isinstance(f, UploadFile) for f in files):
             raise HTTPException(422, "Upload between one and eight images.")
         params = json.loads(form.get("params", "{}"))
         if not isinstance(params, dict):

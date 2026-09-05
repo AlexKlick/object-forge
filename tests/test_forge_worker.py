@@ -139,6 +139,62 @@ class ForgeWorkerTests(unittest.TestCase):
         directory = self.store._job_path(job["id"]).parent / "staged/views"
         return {p.stem: p.read_bytes() for p in directory.glob("*.png")}
 
+    def test_iterate_views_overlays_child_bytes_and_inherits_other_views(self):
+        parent = self.matched()
+        self.submit(parent)
+        self.run_worker()
+        original = self.staged_bytes(parent)
+        self.store.set_state(parent["id"], "queued_bake")
+        self.store.set_state(parent["id"], "baking")
+        self.store.complete(parent["id"])
+        child = self.store.create_job("testa", "v1", intent="iterate_views", parent_job=parent["id"],
+                                      parent_version=1, replacement_views=["front"])
+        replacement = self.images["front"].copy()
+        ImageDraw.Draw(replacement).polygon([(40, 220), (128, 35), (215, 220)], fill=(190, 50, 70, 255))
+        self.store.record_upload(child["id"], "front.png", "image/png", png(replacement))
+        self.run_worker()
+        child = self.client.request("GET", f"/jobs/{child['id']}")
+        self.assertEqual(len(child["match"]["panels"]), 1)
+        self.assertEqual(child["match"]["panels"][0]["auto_view"], "front")
+        self.assertEqual(child["match"]["views_missing"], ["right", "roof"])
+        self.submit(child)
+        self.run_worker()
+        staged = self.staged_bytes(child)
+        self.assertEqual(set(staged), set(original))
+        for view in ("rear", "left"):
+            self.assertEqual(staged[view], original[view])
+        self.assertNotEqual(staged["front"], original["front"])
+        worker = ForgeWorker(self.client, self.assets)
+        panel = child["match"]["panels"][0]
+        crop = worker.matcher.load_image(BytesIO(self.client.request("GET", f"/jobs/{child['id']}/panels/{panel['panel_id']}")))
+        aligned, _ = worker.matcher.align_to_view(crop, worker.render_masks(child)["front"])
+        self.assertEqual(staged["front"], png(aligned))
+        self.assertEqual(self.staged_bytes(parent), original)
+        child = self.client.request("GET", f"/jobs/{child['id']}")
+        self.assertEqual(child["state"], "staged")
+        self.assertEqual(child["inputs"]["parent_views_inherited"], ["left", "rear"])
+
+    def test_empty_iteration_preserves_missing_view_acknowledgment(self):
+        parent = self.matched()
+        self.submit(parent)
+        self.run_worker()
+        self.store.set_state(parent["id"], "queued_bake")
+        self.store.set_state(parent["id"], "baking")
+        self.store.complete(parent["id"])
+        child = self.store.create_job("testa", "v1", intent="iterate_params", parent_job=parent["id"], parent_version=1)
+        self.run_worker()
+        child = self.client.request("GET", f"/jobs/{child['id']}")
+        self.assertEqual(child["state"], "review")
+        self.assertFalse(child["match"]["submitted"])
+        self.assertEqual(child["match"]["views_missing"], ["right", "roof"])
+        from urllib.error import HTTPError
+        with self.assertRaises(HTTPError) as error:
+            self.client.request("POST", f"/jobs/{child['id']}/review", {"mode": "submit", "panels": []})
+        self.assertEqual(error.exception.code, 422)
+        self.submit(child)
+        self.run_worker()
+        self.assertEqual(self.staged_bytes(child), self.staged_bytes(parent))
+
     def test_composite_matches_three_views_rejects_decoy_and_waits_for_review(self):
         job = self.matched()
         self.assertEqual(len(job["canonical_views"]), 5)

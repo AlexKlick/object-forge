@@ -283,3 +283,78 @@ kbd { min-width: 44px; padding: 4px 6px; border: 1px solid var(--line-strong); b
   .result-section { margin-top: 36px; padding: 18px; gap: 22px; }
   .mesh-viewer { min-height: 330px; }
 }
+
+/* Bake Forge shares the Capture shell's controls and palette. */
+[hidden] { display: none !important; }
+.main-tabs { display: flex; gap: 8px; padding-top: 22px; padding-bottom: 0; }
+.main-tabs button, .forge-subtabs button { border: 1px solid var(--line); border-radius: 10px; padding: 12px 20px; background: var(--panel); color: var(--muted); cursor: pointer; }
+.main-tabs [aria-selected="true"], .forge-subtabs [aria-pressed="true"] { color: #b7f174; border-color: #b7f174; background: #b7f17412; }
+.forge-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 22px; flex-wrap: wrap; }
+.forge-heading h1 { font-size: clamp(32px, 5vw, 54px); margin: 8px 0; }
+.forge-heading h2 { margin: 0; }
+.forge-surface { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 24px; margin-bottom: 24px; }
+.forge-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; margin-bottom: 18px; }
+.forge-fields label, .detail-note label { display: grid; gap: 8px; font-size: 13px; color: var(--muted); }
+.forge-check { display: flex !important; align-items: center; gap: 9px; margin: 16px 0; font-size: 14px; }
+.forge-check input { accent-color: #b7f174; }
+.forge-drop { display: grid; text-align: center; gap: 10px; padding: 24px 16px; border: 1px dashed #77816f; border-radius: 12px; cursor: pointer; }
+.forge-drop small { color: var(--muted); }
+.forge-drop input { max-width: 100%; margin: auto; }
+.dragging .forge-drop { border-color: #b7f174; background: #b7f17418; }
+.forge-thumbnails { display: flex; gap: 12px; flex-wrap: wrap; }
+.forge-thumbnails figure { width: 128px; margin: 14px 0; }
+.forge-thumbnails img { width: 128px; height: 100px; object-fit: contain; border-radius: 8px; background: #ffffff0a; }
+.forge-thumbnails figcaption { font-size: 11px; overflow-wrap: anywhere; }
+.forge-slots { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 16px 0; }
+.forge-advanced { margin: 20px 0; }
+.forge-advanced summary, .detail-content summary { cursor: pointer; padding: 12px 0; }
+.forge-error { color: #ff727c; white-space: pre-wrap; overflow-wrap: anywhere; }
+.forge-state, .forge-badge, .forge-lineage { border-radius: 8px; background: #ffffff09; padding: 6px 10px; font-size: 13px; }
+.forge-state[data-state="uploaded"] { color: #abb4c2; }
+.forge-state[data-state="matching"] { color: #62a8ff; }
+.forge-state[data-state="review"] { color: #ffce69; }
+.forge-state[data-state="staged"] { color: #9ed7df; }
+.forge-state[data-state="queued_bake"] { color: #c9b1ff; }
+.forge-state[data-state="baking"] { color: #ffac72; }
+.forge-state[data-state="ready"] { color: #7be39a; }
+.forge-state[data-state="failed"] { color: #ff727c; }
+.forge-log, .forge-panel-pane pre, .detail-content pre { background: #070a08; padding: 14px; border-radius: 10px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
+.forge-log { min-height: 64px; max-height: 220px; }
+.forge-review { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 20px; }
+.forge-review-grid, .forge-detail-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 24px; }
+.forge-sheets canvas { display: block; width: 100%; height: auto; cursor: crosshair; border-radius: 8px; }
+.forge-panel-pane { min-width: 0; }
+.forge-crop { width: 100%; height: 220px; object-fit: contain; background: #ffffff08; border-radius: 12px; }
+.forge-missing { color: #ffce69; padding-top: 16px; }
+.forge-panel-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.forge-version-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 18px; margin-bottom: 32px; }
+.forge-version-card { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; text-align: left; border: 1px solid var(--line); border-radius: 14px; padding: 14px; background: var(--panel); color: inherit; cursor: pointer; }
+.forge-version-card:hover { border-color: #b7f174; }
+.forge-version-card img, .forge-no-thumb { width: 100%; height: 170px; object-fit: contain; background: #ffffff08; border-radius: 8px; }
+.forge-no-thumb { display: grid; place-items: center; color: var(--muted); }
+.forge-version-card small { width: 100%; color: #7be39a; }
+.forge-subtabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 20px 0; }
+.forge-subtabs button { padding: 9px 12px; }
+.forge-viewer { height: 440px; border-radius: 14px; background: #ffffff05; }
+.detail-layers { display: flex; flex-wrap: wrap; gap: 14px; }
+.detail-filmstrip { display: flex; gap: 8px; overflow-x: auto; padding: 4px; }
+.forge-frame { flex: 0 0 90px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: #ffffff08; cursor: pointer; }
+.forge-frame img { width: 90px; height: 90px; object-fit: contain; }
+.forge-lightbox { max-width: 94vw; max-height: 94vh; background: #111710; border: 1px solid var(--line); border-radius: 16px; color: inherit; }
+.forge-lightbox::backdrop { background: #000b; }
+.forge-lightbox img { display: block; max-width: 85vw; max-height: 78vh; object-fit: contain; }
+.forge-metrics { display: grid; gap: 12px; }
+.forge-metrics div { border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.forge-metrics dt { color: var(--muted); text-transform: capitalize; }
+.forge-metrics dd { margin: 6px 0; }
+.detail-content { min-width: 0; }
+.detail-content table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.detail-content th, .detail-content td { padding: 10px 6px; text-align: left; border-bottom: 1px solid var(--line); }
+.detail-note { display: grid; gap: 14px; margin-top: 24px; }
+.detail-note textarea { min-height: 100px; }
+@media (max-width: 850px) {
+  .forge-review-grid, .forge-detail-grid { grid-template-columns: 1fr; }
+  .forge-surface { padding: 16px; }
+  .forge-viewer { height: 330px; }
+  .main-tabs button { padding: 10px 14px; }
+}

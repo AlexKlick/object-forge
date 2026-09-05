@@ -246,7 +246,8 @@ class ForgeWorker:
         checked_path(root, backup.relative_to(root) / "snapshot.json").write_text(json.dumps(manifest, indent=2))
         try:
             views.mkdir(parents=True, exist_ok=True)
-            staged = sorted(p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject")
+            staged = sorted({p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+                            | set(job.get("inputs", {}).get("parent_views_inherited", [])))
             if not staged:
                 raise ValueError("Bake requires staged views.")
             # Fetch all input bytes before mutating the shared drop zone.
@@ -426,16 +427,25 @@ class ForgeWorker:
             self.progress(job, f"VIEW {entry['view']} iou={entry['iou']:.4f}" +
                           (f" reject={entry['reason']}" if "reason" in entry else ""))
         claimed = sorted(entry["view"] for entry in accepted)
-        missing = sorted(set(masks) - set(claimed))
+        missing = sorted(set(masks) - set(claimed)
+                         - set(job.get("inputs", {}).get("parent_views_inherited", [])))
         extras = [panels[e["panel"]]["panel_id"] for e in rejects]
         return {"panels": findings, "views_claimed": claimed, "views_missing": missing,
                 "extras": extras, "rejects": rejects,
                 "extras_allowed": bool(job["params"]["allow_extra"] and not missing)}
 
     def materialize(self, job: dict, masks: dict):
-        if list(masks) != job["canonical_views"]:
+        if masks is not None and list(masks) != job["canonical_views"]:
             raise ValueError("Canonical render listing changed since MATCH.")
         base = f"/jobs/{job['id']}"
+        replaced = {p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+        for view in job.get("inputs", {}).get("parent_views_inherited", []):
+            if view in replaced:
+                continue
+            payload = self.client.request("GET", f"/jobs/{job['parent_job']}/staged/views/{view}.png")
+            self.client.request("POST", base + f"/staged/views/{view}.png", payload,
+                                lease=job["lease"]["lease_id"])
+            self.progress(job, f"VIEW {view} inherited parent={job['parent_job']}")
         for decision in job["match"]["decisions"]:
             if decision["decision"] == "reject":
                 continue
@@ -483,9 +493,15 @@ class ForgeWorker:
             raise ValueError("Review has not been submitted.")
         with self.heartbeats(job):
             self.progress(job, f"START {job['state']} job={job['id']}")
-            masks = self.render_masks(job)
+            empty_iteration = job["parent_job"] and not job["uploads"]
+            masks = None if empty_iteration else self.render_masks(job)
             if job["state"] == "matching":
-                report = self.match(job, masks)
+                if empty_iteration:
+                    missing = sorted(set(job["canonical_views"]) - set(job["inputs"]["parent_views_inherited"]))
+                    report = {"panels": [], "views_claimed": [], "views_missing": missing}
+                    self.progress(job, "MATCH skipped: parameter iteration uses inherited views")
+                else:
+                    report = self.match(job, masks)
             else:
                 self.materialize(job, masks)
         # Stop heartbeats before finalization clears the lease.
@@ -494,6 +510,10 @@ class ForgeWorker:
             body["report"] = report
         suffix = "match" if job["state"] == "matching" else "staged"
         result = self.client.request("POST", f"/jobs/{job['id']}/{suffix}", body)
+        if job["state"] == "matching" and empty_iteration and not report["views_missing"]:
+            self.client.request("POST", f"/jobs/{job['id']}/review", {"mode": "submit", "panels": []})
+            claimed = self.client.request("POST", "/worker/claim", {"stages": ["review"], "job_id": job["id"]})
+            return self.process_match(claimed) if claimed else result
         print(f"DONE {result['state']} job={job['id']}", flush=True)
         return result
 

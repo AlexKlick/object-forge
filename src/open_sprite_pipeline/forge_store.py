@@ -116,8 +116,8 @@ class ForgeStore:
     def _save_job(self, job: dict) -> dict:
         job["updated_at"] = self._now().isoformat()
         path = self._variant_dir(job["asset"], job["variant"]) / "jobs" / job["id"] / "job.json"
-        self._write_json(path, job)
-        return job
+        self._write_json(path, {k: v for k, v in job.items() if k != "worker_log"})
+        return self.get_job(job["id"])
 
     @staticmethod
     def validate_params(params: dict | None) -> dict:
@@ -172,6 +172,13 @@ class ForgeStore:
                 raise ForgeStoreError("Iteration parents must identify the same asset, variant and bake.")
             if canonical_views is None:
                 views = parent["canonical_views"]
+        inherited = []
+        if intent != "fresh":
+            if views != parent["canonical_views"]:
+                raise ForgeStoreError("Iteration must preserve parent canonical views.")
+            inherited = version["inputs"]["staged_views"]
+            for view in inherited:
+                self.staged_view_file(parent_job, view)
         if set(replacements) - set(views):
             raise ForgeStoreError("Replacement views must be canonical views.")
         job = {
@@ -179,6 +186,7 @@ class ForgeStore:
             "parent_job": parent_job, "parent_version": parent_version, "intent": intent,
             "state": "uploaded", "params": values, "canonical_views": views,
             "replacement_views": replacements, "uploads": [],
+            "inputs": {"parent_views_inherited": list(inherited)},
             "match": {"panels": [], "decisions": [], "views_missing": []},
             "created_at": self._now().isoformat(), "updated_at": self._now().isoformat(),
             "error": None, "accepted": False, "notes": [], "lease": None,
@@ -187,11 +195,17 @@ class ForgeStore:
 
     @locked
     def get_job(self, job_id: str) -> dict:
-        return self._read(self._job_path(job_id))
+        return self._read_job(self._job_path(job_id))
+
+    def _read_job(self, path: Path) -> dict:
+        job = self._read(path)
+        log = self._checked(path.parent / "worker.log")
+        job["worker_log"] = log.read_text().splitlines() if log.exists() else []
+        return job
 
     @locked
     def list_jobs(self, *, state: str | None = None, asset: str | None = None) -> list[dict]:
-        jobs = [self._read(p) for p in self.root.glob("assets/*/variants/*/jobs/*/job.json")]
+        jobs = [self._read_job(p) for p in self.root.glob("assets/*/variants/*/jobs/*/job.json")]
         return sorted((j for j in jobs if (state is None or j["state"] == state)
                        and (asset is None or j["asset"] == asset)), key=lambda j: (j["created_at"], j["id"]))
 
@@ -285,6 +299,7 @@ class ForgeStore:
             raise ForgeConflict("Submitted review decisions are immutable.")
         canonical = set(job["canonical_views"])
         missing = set(self._views(views_missing))
+        inherited = set(job.get("inputs", {}).get("parent_views_inherited", []))
         covered, ids = set(), set()
         for panel in panels:
             panel_id = self._name(panel["panel_id"])
@@ -299,9 +314,9 @@ class ForgeStore:
                 if view not in canonical or view in covered:
                     raise ForgeStoreError("Accepted views must be canonical and unique.")
                 covered.add(view)
-        if missing - canonical or missing & covered:
+        if missing - canonical or missing & (covered | inherited):
             raise ForgeStoreError("Missing views must be uncovered canonical views.")
-        if mode == "submit" and (not canonical or canonical - covered - missing):
+        if mode == "submit" and (not canonical or canonical - covered - inherited - missing):
             raise ForgeStoreError("Every canonical view must be covered or explicitly missing.")
         if job["match"].get("report_saved"):
             known = {p["panel_id"] for p in job["match"]["panels"]}
@@ -327,6 +342,8 @@ class ForgeStore:
     def patch_canonical_views(self, job_id: str, views: list[str], lease_id: str) -> dict:
         job = self._worker_job(job_id, lease_id, "matching")
         views = self._views(views)
+        if job["parent_job"] and views != job["canonical_views"]:
+            raise ForgeStoreError("Iteration must preserve parent canonical views.")
         if not views or set(job["replacement_views"]) - set(views):
             raise ForgeStoreError("Render views must cover replacement views and be nonempty.")
         job["canonical_views"] = views
@@ -360,6 +377,7 @@ class ForgeStore:
     def worker_staged_view(self, job_id: str, view: str, payload: bytes, lease_id: str) -> None:
         job = self._worker_job(job_id, lease_id, "review")
         accepted = {p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+        accepted.update(job.get("inputs", {}).get("parent_views_inherited", []))
         if not job["match"].get("submitted") or view not in accepted:
             raise ForgeConflict("Staged images require submitted decisions for the view.")
         self.save_staged_view(job_id, view, payload)
@@ -373,12 +391,16 @@ class ForgeStore:
         if not job["match"].get("submitted"):
             raise ForgeConflict("Review has not been submitted.")
         expected = {p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+        inherited = set(job.get("inputs", {}).get("parent_views_inherited", [])) - expected
+        expected.update(inherited)
         directory = self._checked(self._job_path(job_id).parent / "staged" / "views")
         actual = {p.stem for p in directory.glob("*.png")}
         if actual != expected:
             raise ForgeConflict("Staged images must exactly cover submitted decisions.")
         for view in expected:
             self._file(directory / f"{view}.png")
+        job.setdefault("inputs", {})["parent_views_inherited"] = sorted(inherited)
+        self._save_job(job)
         return self.set_state(job_id, "staged")
 
     @locked
@@ -470,7 +492,7 @@ class ForgeStore:
     @staticmethod
     def _summary(version: dict) -> dict:
         return {key: version[key] for key in ("number", "asset", "variant", "origin", "job_id",
-                                              "created_at", "accepted", "metrics", "notes")}
+                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", [])}
 
     def _index(self, asset: str, variant: str) -> list[dict]:
         directory = self._variant_dir(asset, variant)
@@ -512,8 +534,10 @@ class ForgeStore:
                        "staged_views": sorted(p.stem for p in self._checked(
                            self._job_path(job_id).parent / "staged" / "views").glob("*.png")),
                        "replacement_views": job["replacement_views"],
-                       "parent_views_inherited": [v for v in job["canonical_views"]
-                                                  if parent and v not in job["replacement_views"]]},
+                       "parent_views_inherited": (job.get("inputs", {}).get("parent_views_inherited", [])
+                                                  if job["match"].get("report_saved") else
+                                                  [v for v in job["canonical_views"]
+                                                   if parent and v not in job["replacement_views"]])},
             "metrics": {"part_layers": {}, **metrics}, "critic": {"status": "pending"},
             "created_at": self._now().isoformat(), "accepted": False, "notes": [],
         }
@@ -536,6 +560,7 @@ class ForgeStore:
             if len(value) > 32 * 1024 * 1024:
                 raise ForgeStoreError("Each completion artifact is limited to 32 MiB.")
             prepared[relative] = value
+        version["artifacts"] = sorted(p.as_posix() for p in prepared)
         # Publish an entire version at once; failed writes never consume a number.
         pending = self._checked(directory.with_name(f".pending-{uuid4().hex}"))
         try:
@@ -549,7 +574,7 @@ class ForgeStore:
             if pending.exists():
                 shutil.rmtree(pending)
         self._index(job["asset"], job["variant"])
-        return version
+        return self.get_version(job["asset"], job["variant"], number)
 
     @locked
     def complete(self, job_id: str, *, artifacts: dict | None = None, metrics: dict | None = None,
@@ -566,7 +591,15 @@ class ForgeStore:
 
     @locked
     def get_version(self, asset: str, variant: str, number: int) -> dict:
-        return self._read(self._version_dir(asset, variant, number) / "version.json")
+        directory = self._version_dir(asset, variant, number)
+        version = self._read(directory / "version.json")
+        report_path = self._checked(directory / "artifacts" / "bake_report.json")
+        report = self._read(report_path) if report_path.exists() else {}
+        version["part_layer_map"] = {part["id"]: part["layer"] for part in report.get("parts", [])
+                                     if "id" in part and "layer" in part}
+        version.setdefault("artifacts", sorted(p.relative_to(directory / "artifacts").as_posix()
+                                               for p in (directory / "artifacts").rglob("*") if p.is_file()))
+        return version
 
     @locked
     def list_versions(self, asset: str | None = None, variant: str | None = None, *,
