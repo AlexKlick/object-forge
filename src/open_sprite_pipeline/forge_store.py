@@ -416,8 +416,8 @@ class ForgeStore:
                   job_id: str | None = None) -> dict | None:
         if kind not in {"pipeline", "critic"}:
             raise ForgeStoreError("Unknown worker kind.")
-        if kind == "critic":  # Reserved; critic execution is Phase 5.
-            return None
+        if kind == "critic":
+            return self.claim_critic()
         now = self._now()
         jobs = self.list_jobs()
         for job in jobs:
@@ -492,7 +492,75 @@ class ForgeStore:
     @staticmethod
     def _summary(version: dict) -> dict:
         return {key: version[key] for key in ("number", "asset", "variant", "origin", "job_id",
-                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", [])}
+                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", []), "critic": version.get("critic", {"status": "pending"})}
+
+    @locked
+    def claim_critic(self) -> dict | None:
+        now = self._now()
+        for summary in sorted(self.list_versions(), key=lambda v: (v["created_at"], v["number"]), reverse=True):
+            if summary["critic"]["status"] != "pending":
+                continue
+            version = self.get_version(summary["asset"], summary["variant"], summary["number"])
+            # Version publication precedes job completion. Critic cannot claim in that gap.
+            if self.get_job(version["job_id"])["state"] != "ready":
+                continue
+            lease = version.get("critic_lease")
+            if lease and datetime.fromisoformat(lease["lease_expires_at"]) > now:
+                continue
+            version["critic_lease"] = {"kind": "critic", "lease_id": uuid4().hex,
+                                       "lease_expires_at": (now + timedelta(seconds=300)).isoformat()}
+            self._write_json(self._version_dir(version["asset"], version["variant"], version["number"]) / "version.json", version)
+            return version
+        return None
+
+    @locked
+    def get_critic(self, asset: str, variant: str, number: int) -> dict:
+        version = self.get_version(asset, variant, number)
+        critic = version.get("critic", {"status": "pending"})
+        if critic["status"] == "pending":
+            return critic
+        return self._read(self._version_dir(asset, variant, number) / "critic" / "critic.json")
+
+    @locked
+    def rerun_critic(self, asset: str, variant: str, number: int) -> dict:
+        version = self.get_version(asset, variant, number)
+        version.update(critic={"status": "pending"}, critic_lease=None)
+        self._write_json(self._version_dir(asset, variant, number) / "version.json", version)
+        self._index(asset, variant)
+        return version["critic"]
+
+    @locked
+    def complete_critic(self, asset: str, variant: str, number: int, lease_id: str, verdict: dict) -> dict:
+        from .forge_critic import validate_verdict
+
+        version = self.get_version(asset, variant, number)
+        lease = version.get("critic_lease")
+        if (not lease or lease["lease_id"] != lease_id
+                or datetime.fromisoformat(lease["lease_expires_at"]) <= self._now()
+                or version["critic"]["status"] != "pending"):
+            raise ForgeConflict("Missing, stale or expired critic lease.")
+        status = verdict.get("status")
+        if status not in {"pass", "warn", "fail", "error", "skipped"}:
+            raise ForgeStoreError("Invalid critic status.")
+        if status in {"pass", "warn", "fail"}:
+            validate_verdict({key: verdict.get(key) for key in ("overall", "score", "issues", "summary")})
+            if verdict["overall"] != status:
+                raise ForgeStoreError("Critic status must match overall.")
+        elif verdict.get("score") is not None or verdict.get("issues") != []:
+            raise ForgeStoreError("Unavailable critic must have no score or issues.")
+        if any(not isinstance(verdict.get(key), str) for key in ("summary", "model")):
+            raise ForgeStoreError("Critic requires summary and model.")
+        if "excerpt" in verdict and (not isinstance(verdict["excerpt"], str) or len(verdict["excerpt"]) > 400):
+            raise ForgeStoreError("Critic excerpt must be at most 400 characters.")
+        verdict = {**verdict, "at": self._now().isoformat()}
+        version["critic"] = {key: verdict[key] for key in ("status", "score", "summary", "model", "at")}
+        version["critic"]["issues"] = len(verdict["issues"])
+        version["critic_lease"] = None
+        directory = self._version_dir(asset, variant, number)
+        self._write_json(directory / "critic" / "critic.json", verdict)
+        self._write_json(directory / "version.json", version)
+        self._index(asset, variant)
+        return verdict
 
     def _index(self, asset: str, variant: str) -> list[dict]:
         directory = self._variant_dir(asset, variant)

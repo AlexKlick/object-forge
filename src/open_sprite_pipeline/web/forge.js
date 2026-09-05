@@ -11,6 +11,7 @@ const artifactPath = (v, name) => `${versionPath(v)}/artifacts/${name.split("/")
 const lineage = (v) => v.lineage?.parent_version ? `v${v.number} ← v${v.lineage.parent_version}` : `v${v.number} · root`;
 const pretty = (value) => esc(JSON.stringify(value, null, 2));
 const button = (text, action, style = "secondary") => `<button type="button" class="button ${style}" data-action="${action}">${esc(text)}</button>`;
+const criticBadge = (status = "pending") => `<span class="forge-badge critic-${["pass", "warn", "fail"].includes(status) ? status : "neutral"}">Critic: ${esc(status)}</span>`;
 const guard = (fn) => async (...args) => { try { await fn(...args); } catch (error) { toast(error.message, true); } };
 
 function showTab(name) {
@@ -367,6 +368,7 @@ class LibraryView {
         const card = document.createElement("button"); card.type = "button"; card.className = "forge-version-card";
         const frame = version.artifacts?.find((name) => name.startsWith("turntable/") && name.endsWith(".png")) || (version.metrics.turntable_frames ? "turntable/tt_00.png" : null);
         card.innerHTML = `${frame ? `<img src="${artifactPath(version, frame)}" alt="First turntable frame" loading="lazy">` : '<div class="forge-no-thumb">No turntable</div>'}<strong>${version.accepted ? "★ " : ""}v${version.number}</strong><span class="forge-badge">${esc(version.origin)}</span><span class="forge-lineage">${lineage(version)}</span><small>${esc(version.state || "ready")}</small>`;
+        card.innerHTML += criticBadge(version.critic?.status);
         card.onclick = guard(() => detail.open(version)); $(".forge-version-grid", section).append(card);
       }
     }
@@ -454,9 +456,17 @@ class VersionDetail {
   }
 
   tab(name) {
+    this.activeTab = name;
+    clearTimeout(this.criticTimer);
     for (const tab of this.root.querySelectorAll(".forge-subtabs button")) tab.setAttribute("aria-pressed", String(tab.dataset.action === name));
     const content = $(".detail-content", this.root); const v = this.version;
-    if (name === "Critic") { content.innerHTML = '<p class="notice">Critic: pending — Phase 5</p>'; return; }
+    if (name === "Critic") {
+      content.textContent = "Loading critic…";
+      this.showCritic().catch((error) => {
+        if (this.activeTab === "Critic" && this.version === v) content.textContent = `Critic unavailable: ${error.message}`;
+      });
+      return;
+    }
     if (name === "Bake report") {
       content.innerHTML = `<dl class="forge-metrics">${Object.entries(v.metrics).map(([key, value]) => `<div><dt>${esc(key.replaceAll("_", " "))}</dt><dd>${typeof value === "object" ? `<pre>${pretty(value)}</pre>` : esc(String(value))}</dd></div>`).join("")}</dl><details><summary>Full bake report JSON</summary><pre>${pretty(this.report)}</pre></details>`;
     } else if (name === "Views") {
@@ -467,6 +477,32 @@ class VersionDetail {
     } else if (name === "History") {
       content.innerHTML = `<p class="forge-lineage">${this.chain.map((v) => `v${v.number}`).join(" ← ")} · root v${v.lineage.root_version}</p><p>Created: ${esc(v.created_at)}<br>Job updated: ${esc(this.job.updated_at || "unavailable")}</p>${this.job.history_error ? `<p class="forge-error">Job history unavailable: ${esc(this.job.history_error)}</p>` : ""}<h4>Notes</h4>${[...(this.job.notes || []), ...v.notes].map((note) => `<blockquote><p>${esc(note.text)}</p><small>${esc(note.author)} · ${esc(note.at)}</small></blockquote>`).join("") || "<p>No notes yet.</p>"}<h4>Job decisions and inputs</h4><pre>${pretty({ intent: this.job.intent, decisions: this.job.match?.decisions, inputs: v.inputs })}</pre><h4>Lineage dates</h4><pre>${pretty(this.chain.map((v) => ({ version: v.number, job: v.job_id, created_at: v.created_at })))}</pre>`;
     }
+  }
+
+  async showCritic() {
+    const version = this.version; const request = this.request;
+    const verdict = await api(`${versionPath(version)}/critic`);
+    if (request !== this.request || this.activeTab !== "Critic" || this.root.hidden) return;
+    const content = $(".detail-content", this.root);
+    content.innerHTML = `<div class="button-row">${criticBadge(verdict.status)}<strong>${verdict.score == null ? "No score" : `${esc(verdict.score)} / 100`}</strong>${button("Rerun critic", "rerun-critic")}</div>
+      <p>${esc(verdict.summary || "Waiting for the local critic worker.")}</p>
+      ${verdict.excerpt ? `<pre class="critic-excerpt">${esc(verdict.excerpt)}</pre>` : ""}
+      <ul class="critic-issues">${(verdict.issues || []).map((issue) => `<li><span class="forge-badge">${issue.frame == null ? "All frames" : `Frame ${esc(issue.frame)}`}</span> <strong>${esc(issue.severity)}</strong> · ${esc(issue.kind)}<p>${esc(issue.note)}</p></li>`).join("")}</ul>
+      <footer><small>${esc(verdict.model || "Model pending")} · ${esc(verdict.at || "Not run yet")}</small></footer>`;
+    $("[data-action=rerun-critic]", content).onclick = guard(async (event) => {
+      event.currentTarget.disabled = true;
+      try {
+        await api(`${versionPath(version)}/critic/rerun`, json({}));
+        if (request === this.request && this.activeTab === "Critic") await this.showCritic();
+      } finally {
+        const rerun = $("[data-action=rerun-critic]", content);
+        if (rerun) rerun.disabled = false;
+      }
+    });
+    clearTimeout(this.criticTimer);
+    if (verdict.status === "pending") this.criticTimer = setTimeout(() => {
+      if (request === this.request && this.activeTab === "Critic" && !this.root.hidden) this.tab("Critic");
+    }, 2000);
   }
 }
 

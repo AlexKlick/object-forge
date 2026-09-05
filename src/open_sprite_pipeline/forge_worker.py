@@ -127,6 +127,7 @@ class ForgeWorker:
         self.client = client
         self.assets = assets.resolve()
         self._matcher = None
+        self.critic = None
 
     @property
     def matcher(self):
@@ -173,6 +174,43 @@ class ForgeWorker:
                 if job is not None:
                     return self.process(job, bake_root=root)
         return None
+
+    def init_critic(self):
+        from .forge_critic import CriticClient
+
+        if self.critic is None:
+            try:
+                self.critic = CriticClient.from_env()
+            except Exception as exc:
+                # Client hard-refuses bad URLs; the optional lane cannot stop baking.
+                self.critic = CriticClient("", enabled=False)
+                self.critic.reason = f"Critic configuration refused: {exc}"
+                print("CRITIC disabled for process lifetime: " + self.critic.reason, flush=True)
+            self.critic.probe()
+
+    def run_critic_next(self):
+        self.init_critic()
+        version = self.client.request("POST", "/worker/claim", {"kind": "critic"})
+        if version is None:
+            return None
+        path = f"/assets/{version['asset']}/variants/{version['variant']}/versions/{version['number']}"
+        verdict = self.critic.review(version, lambda name: self.client.request("GET", path + "/artifacts/" + name))
+        result = self.client.request("POST", path + "/critic", {
+            "lease_id": version["critic_lease"]["lease_id"], "verdict": verdict})
+        print(f"CRITIC v{version['number']} " + json.dumps(result), flush=True)
+        return result
+
+    def critic_loop(self, stopped: Event, interval: float):
+        # Independent from run_next/process and their job-failure reporting path.
+        self.init_critic()
+        while not stopped.is_set():
+            try:
+                result = self.run_critic_next()
+            except Exception as exc:
+                print(f"CRITIC storage unavailable: {type(exc).__name__}: {exc}", flush=True)
+                result = None
+            if result is None:
+                stopped.wait(interval)
 
     def bake_command(self, job: dict) -> list[str]:
         override = os.getenv("FORGE_BAKE_CMD")
@@ -529,16 +567,19 @@ def main() -> int:
         raise ValueError("FORGE_POLL_INTERVAL must be finite and positive.")
     client = ForgeClient(os.getenv("FORGE_API", "http://127.0.0.1:8070"), os.getenv("FORGE_WORKER_TOKEN", ""))
     worker = ForgeWorker(client, Path(os.getenv("FORGE_SPIKE_ASSETS", str(DEFAULT_SPIKE_ASSETS))))
+    if not once:
+        # Model calls never occupy the pipeline loop, even when a bake arrives mid-review.
+        Thread(target=worker.critic_loop, args=(Event(), interval), daemon=True).start()
     while True:
         try:
             result = worker.run_next()
-            if result is not None:
-                if once:
-                    return 0
-            elif once:
-                # A bounded one-shot invocation is also safe against already staged jobs.
+            if once:
+                try:
+                    worker.run_critic_next()
+                except Exception as exc:
+                    print(f"CRITIC storage unavailable: {type(exc).__name__}: {exc}", flush=True)
                 return 0
-            else:
+            if result is None:
                 time.sleep(interval)
         except Exception as exc:
             print(f"ERROR {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

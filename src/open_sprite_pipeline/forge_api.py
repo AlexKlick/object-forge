@@ -4,7 +4,7 @@ Multipart jobs accept ``files`` or ``files[]`` and JSON strings for ``params``,
 ``canonical_views`` and ``replacement_views``. Completion artifacts are JSON
 values, UTF-8 strings, or {"encoding": "base64", "data": "..."} blobs. Claimed
 jobs require the returned lease.lease_id on progress and completion; progress
-without a state is a heartbeat. Critic claims return 204 until Phase 5.
+without a state is a heartbeat. Critic claims use a separate version lease.
 """
 from __future__ import annotations
 
@@ -115,6 +115,11 @@ class Complete(Payload):
 
 class Accept(Payload):
     accepted: bool = True
+
+
+class CriticComplete(Payload):
+    lease_id: str
+    verdict: dict[str, Any]
 
 
 class Note(Payload):
@@ -335,3 +340,19 @@ def note(request: Request, asset: str, variant: str, number: int, body: Note):
 @forge_router.get(_VERSION + "/{number}/layers")
 def layers(request: Request, asset: str, variant: str, number: int):
     return store(request).get_version(asset, variant, number)["metrics"].get("part_layers", {})
+
+
+@forge_router.get(_VERSION + "/{number}/critic")
+def critic(request: Request, asset: str, variant: str, number: int):
+    return store(request).get_critic(asset, variant, number)
+
+
+@forge_router.post(_VERSION + "/{number}/critic/rerun")
+def rerun_critic(request: Request, asset: str, variant: str, number: int):
+    # Like approval/acceptance, this is a local operator UI action.
+    return store(request).rerun_critic(asset, variant, number)
+
+
+@forge_router.post(_VERSION + "/{number}/critic", dependencies=[Depends(worker_auth)])
+def save_critic(request: Request, asset: str, variant: str, number: int, body: CriticComplete):
+    return store(request).complete_critic(asset, variant, number, body.lease_id, body.verdict)

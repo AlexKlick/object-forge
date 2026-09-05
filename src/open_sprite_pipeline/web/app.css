@@ -358,3 +358,12 @@ kbd { min-width: 44px; padding: 4px 6px; border: 1px solid var(--line-strong); b
   .forge-viewer { height: 330px; }
   .main-tabs button { padding: 10px 14px; }
 }
+
+/* Bake Forge optional vision verdicts. */
+.forge-badge.critic-pass { background: #164d35; color: #a5efc8; }
+.forge-badge.critic-warn { background: #684b12; color: #ffe0a0; }
+.forge-badge.critic-fail { background: #6a2530; color: #ffc0c7; }
+.forge-badge.critic-neutral { background: #39414c; color: #d5dbe4; }
+.critic-issues { padding-left: 1.25rem; }
+.critic-issues li { margin-block: 1rem; }
+.critic-excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }

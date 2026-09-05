@@ -1,4 +1,4 @@
-# Bake Forge P3 host worker
+# Bake Forge host worker (P1–P5)
 
 Run one API writer and any host workers against its loopback origin. The API
 owns the store; the worker uses only stdlib urllib for HTTP and PIL/spike helpers
@@ -21,7 +21,10 @@ Worker environment:
 | `FORGE_POLL_INTERVAL` | 2 seconds; finite and positive |
 | `FORGE_BAKE_PYTHON` | `/home/alexk/.venv/bin/python`; runs the installed `tools/bake.py` |
 | `FORGE_BAKE_CMD` | Unset; test-only whole-command override, split with `shlex` and executed without a shell |
-| `FORGE_ONCE` | `1`, `true`, `yes`, `on` process one available job, or exit on an empty claim |
+| `FORGE_ONCE` | `1`, `true`, `yes`, `on`: process at most one pipeline job, then at most one critic version |
+| `FORGE_CRITIC_URL` | `http://127.0.0.1:18001/v1`; HTTP localhost, 127.0.0.1 or ::1 only |
+| `FORGE_CRITIC_MODEL` | `Qwen/Qwen3.5-4B` |
+| `FORGE_CRITIC_ENABLED` | Enabled when URL is nonempty; `0` disables; truthy values: `1`, `true`, `yes`, `on` |
 
 The worker inserts `<spike>/tools` into `sys.path`, disables bytecode writes, and
 imports `sheet_match` read-only. It never calls the tool's writing `run`/`main`
@@ -155,3 +158,44 @@ and the harvested turntable count. A report-provided `selfcheck` is retained.
 The installed report omits it, so the worker extracts per-view silhouette IoUs
 from the harvested Blender log and the threshold from the read-only
 `SELFCHECK_THRESHOLD` constant in `tools/bake_views.py`.
+
+## P5 optional vision critic
+
+The long-running worker has an independent critic thread. Slow or unavailable
+inference cannot occupy the bake loop or change a ready job to failed. Critic
+claims select the newest pending version whose job is ready, with an independent
+300-second lease. Expired claims are reclaimable. `FORGE_ONCE=1` finishes its
+pipeline action first, then handles one critic claim before exiting.
+
+Each worker probes the configured endpoint once using a tiny text request and
+`chat_template_kwargs: {enable_thinking: false}`. An unsuccessful probe disables
+inference for that process lifetime and logs one disable line. Pending reviews
+then become skipped, including reruns in that same process. A new worker process
+is required to probe again. The retained `probe` records HTTP 200, HTTP acceptance
+of the kwarg, and explicit echo separately; HTTP acceptance does not establish
+that the server applied the template option.
+
+All critic HTTP uses stdlib urllib with proxies and redirects disabled. The
+client raises for nonlocal URLs; the worker catches configuration refusal and
+skips critic work. `localhost` is pinned to numeric 127.0.0.1. No model catalog or
+shared inference defaults are modified.
+
+Up to four evenly sampled turntable frames are sent as JPEG data URLs, with a
+768-pixel maximum dimension and quality 85, alongside the version metrics.
+Pillow is already installed; no new dependency is required. Valid JSON fences
+are stripped. Invalid JSON or verdict schema gets exactly one repair request;
+a second invalid response yields `error` and its first 400 characters. Transport
+or image-read failures yield `skipped`. Pass, warn, and fail are advisory verdicts
+and never change bake readiness.
+
+Version endpoint suffixes:
+
+- `GET /critic`: full verdict, or `{status: "pending"}` before completion.
+- `POST /critic/rerun`: local UI action; resets to pending and invalidates an
+  in-flight lease so an older worker cannot overwrite the rerun.
+- `POST /critic`: worker-authenticated completion with `lease_id` and `verdict`.
+
+The API writes `critic/critic.json` and a compact `version.json` critic summary
+whose `issues` field is a count. Library and version listings include that
+summary. The Critic tab shows the full issues, score, summary, failure excerpt,
+model and timestamp; it polls pending verdicts and provides a rerun button.
