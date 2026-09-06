@@ -29,8 +29,10 @@ from open_sprite_pipeline.forge_worker import ForgeWorker
 FAKE = r"""
 import json
 from pathlib import Path
+import struct
 import sys
 import time
+from PIL import Image
 root, mode = Path(sys.argv[1]), sys.argv[2]
 views = root / "styled/a/v/views"
 assert sorted(p.name for p in views.glob("*.png")) == ["front.png"]
@@ -52,9 +54,41 @@ report = {"asset": "a", "variant": "v", "parts": [{"layer": "core"}, {"layer": "
           "fallback_split": {"underside": 0.1, "gap": 0.1}}
 (out / "bake_report.json").write_text(json.dumps(report, separators=(",", ":")))
 (out / "harmonize_report.json").write_text(json.dumps({"views": [{"view": "front", "drift_mean": 0.03}]}))
-(out / "a_v.glb").write_bytes(b"glTF fake model")
+
+# A real GLB and a real atlas, because the worker now reads the exported bytes:
+# a stub would make the GLB gate untestable and silently vacuous.
+def glb(alpha_mode=None, uv_sets=1, uv=(0.2, 0.2)):
+    attributes = {"POSITION": 0}
+    for i in range(uv_sets):
+        attributes["TEXCOORD_%d" % i] = 1
+    material = {"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}
+    if alpha_mode:
+        material["alphaMode"] = alpha_mode
+    blob = struct.pack("<9f", *([0.0] * 9)) + struct.pack("<6f", *(uv * 3))
+    doc = {"asset": {"version": "2.0"}, "materials": [material],
+           "meshes": [{"primitives": [{"attributes": attributes, "material": 0}]}],
+           "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                         {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2"}],
+           "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                           {"buffer": 0, "byteOffset": 36, "byteLength": 24}],
+           "buffers": [{"byteLength": len(blob)}]}
+    js = json.dumps(doc).encode()
+    js += b" " * (-len(js) % 4)
+    body = (struct.pack("<II", len(js), 0x4E4F534A) + js
+            + struct.pack("<II", len(blob), 0x004E4942) + blob)
+    return b"glTF" + struct.pack("<II", 2, 12 + len(body)) + body
+
+shapes = {"glb_blend": {"alpha_mode": "BLEND"}, "glb_two_uv": {"uv_sets": 2},
+          "glb_untextured": {"uv": (0.9, 0.9)}, "glb_no_uv": {"uv_sets": 0}}
+(out / "a_v.glb").write_bytes(
+    b"not a gltf" if mode == "glb_corrupt" else glb(**shapes.get(mode, {})))
 if mode != "stale_atlas":
-    (out / "atlas.png").write_bytes(b"atlas fake bytes")
+    # Opaque only in the top-left quadrant, so a UV can miss it on purpose.
+    atlas = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+    for y in range(4):
+        for x in range(4):
+            atlas.putpixel((x, y), (200, 190, 170, 255))
+    atlas.save(out / "atlas.png")
 (out / "turntable/tt_00.png").write_bytes(b"turntable fake bytes")
 sys.exit(7 if mode == "fail" else 0)
 """
@@ -225,7 +259,8 @@ class ForgeBakeTests(unittest.TestCase):
             "part_layers": {"core": 2, "social": 1}, "parts_total": 3,
             "coverage": {"front": 0.8, "palette": 0.2}, "bleed_avoided": 2, "bleed_faces": 0,
             "fallback_split": {"underside": 0.1, "gap": 0.1}, "harmonize_drift": {"front": 0.03},
-            "turntable_frames": 1, "selfcheck": {"threshold": 0.97, "views": {"front": 0.99}}})
+            "turntable_frames": 1, "selfcheck": {"threshold": 0.97, "views": {"front": 0.99}},
+            "glb": {"parsed": True, "alpha_modes": ["OPAQUE"], "uv_sets": 1, "textured": 1.0}})
         for path in self.output.rglob("*"):
             if path.is_file():
                 stored = self.store.artifact_file("a", "v", 1, path.relative_to(self.output).as_posix())
@@ -237,6 +272,36 @@ class ForgeBakeTests(unittest.TestCase):
         next_job = self.approve(self.staged())
         self.worker.run_next()
         self.assertEqual(self.store.get_job(next_job["id"])["version_number"], 2)
+
+    def test_unusable_glb_fails_the_job_instead_of_publishing_a_version(self):
+        """Every other bake metric is measured inside Blender, so a mesh that
+        exports unusable still passes them all — v1 shipped exactly that and the
+        critic then scored it 85/100. These must fail the job, not the render."""
+        cases = {
+            "glb_blend": "alphaMode BLEND",
+            "glb_two_uv": "2 UV sets exported",
+            "glb_untextured": "land on painted atlas texels",
+            "glb_no_uv": "no TEXCOORD set exported",
+            "glb_corrupt": "not parseable as glTF binary",
+        }
+        for mode, expected in cases.items():
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                job = self.approve(self.staged())
+                with self.assertRaisesRegex(ValueError, "Exported GLB is unusable"):
+                    self.worker.run_next()
+                self.assertIn(expected, (self.store._job_path(job["id"]).parent
+                                         / "worker.log").read_text())
+                self.assertEqual(self.store.get_job(job["id"])["state"], "failed")
+                self.assertIsNone(self.store.get_job(job["id"]).get("version_number"))
+                self.assert_restored(job)
+
+    def test_glb_check_marker_records_what_was_measured(self):
+        self.approve(self.staged())
+        self.assertEqual(self.worker.run_next()["state"], "ready")
+        log = (self.store._job_path(self.store.get_version("a", "v", 1)["job_id"]).parent
+               / "worker.log").read_text()
+        self.assertIn("GLB-CHECK ok textured=1.0 uv_sets=1 alpha=OPAQUE", log)
 
     def test_failure_rc_or_missing_marker_restores_and_releases(self):
         for mode in ("fail", "no_marker"):

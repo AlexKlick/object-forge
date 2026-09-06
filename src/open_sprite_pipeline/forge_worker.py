@@ -29,6 +29,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from . import forge_glb
+
 DEFAULT_SPIKE_ASSETS = Path("/home/alexk/debt-city-greybox-spike/apps/greybox/assets")
 BAKE_MARKERS = re.compile(r"\b(?:PROJECT|SELFCHECK|VIEW-VALIDATE|TURNTABLE|BAKE|VERIFY)\b")
 
@@ -431,6 +433,19 @@ class ForgeWorker:
                 raise ValueError("Cannot determine bake selfcheck threshold.")
             metrics["selfcheck"] = {"threshold": float(threshold[1]), "views": {
                 view: float(iou) for view, iou in re.findall(r"SELFCHECK (\S+) silhouette IoU=([0-9.]+)", seen)}}
+        # Everything above this line is a Blender-side measurement, and v1 passed
+        # all of it while exporting a mesh that renders as nothing in a real-time
+        # engine. Read the exported bytes instead, and refuse to publish a
+        # version the client cannot draw — a broken artifact marked ready is
+        # worse than a failed job, because the critic then scores it.
+        glb_name = f"{job['asset']}_{job['variant']}.glb"
+        metrics["glb"] = forge_glb.inspect(raw[glb_name], raw.get("atlas.png"))
+        unusable = forge_glb.violations(metrics["glb"])
+        if unusable:
+            raise ValueError(f"Exported GLB is unusable: {'; '.join(unusable)}")
+        self.progress(job, f"GLB-CHECK ok textured={metrics['glb']['textured']} "
+                           f"uv_sets={metrics['glb']['uv_sets']} "
+                           f"alpha={','.join(metrics['glb']['alpha_modes']) or 'none'}")
         return artifacts, metrics
 
     def progress(self, job: dict, *markers: str, **fields):
