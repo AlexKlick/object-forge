@@ -9,6 +9,17 @@ services:
     container_name: open-sprite-object-forge
     init: true
     restart: unless-stopped
+    # Run as the host user so nothing written to the bind mounts is root-owned.
+    # As root, the API created a fresh root-owned jobs/<id>/ per Forge job and
+    # the host worker (which must run outside the container, because Blender
+    # cannot run in it) then failed on views_backup — after the job had already
+    # reached queued_bake. The documented `docker exec ... chown` only ever
+    # fixed directories that already existed, so it had to be re-run between
+    # staging and approving every single job.
+    #
+    # Changing this requires a one-time migration of content the container
+    # wrote while it was root; see docs/BAKE_FORGE.md step 3b.
+    user: "1000:1000"
     ports:
       - "127.0.0.1:8050:8050"
     environment:
