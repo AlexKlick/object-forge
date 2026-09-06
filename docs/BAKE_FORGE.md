@@ -86,29 +86,47 @@ override even if this advisory check cannot establish identity.
    `store_root: /data/runs/ui/forge`. A health response alone does not prove
    Forge is enabled. Check host ownership/read-write access on the bind mount.
 
-3b. **RECURRING — fix store ownership.** The container runs as root, so every
-   directory the API creates under the bind mount is root-owned while the host
-   worker runs as your user. This is **not** a first-boot-only problem: the API
-   creates a fresh `jobs/<job_id>/` per job, so a chown you ran yesterday does
-   nothing for a job created today. Observed failure modes:
+3b. **Store ownership — fixed in compose; migration needed once per deployment.**
 
-   - `PermissionError: ... /ui/forge/locks` — store root never chowned; bake
-     jobs sit in `queued_bake`.
-   - `PermissionError: ... jobs/<id>/views_backup` — the *job* directory is
-     root-owned; the job reaches `queued_bake`, then fails at bake start.
+   The API writes the forge store from inside the container; the host worker
+   writes the same store from outside (Blender cannot run in the container).
+   The compose service therefore sets `user: "1000:1000"` so both write as the
+   same uid and nothing under the bind mounts is ever root-owned.
 
-   Stopgap, between staging a job and approving it (no host sudo needed):
+   A deployment that ran as root before this change still holds root-owned
+   content the container can no longer write. Migrate it **once**, from inside
+   the container while it is still running as root, i.e. *before* recreating:
 
    ```bash
-   docker exec open-sprite-object-forge chown -R 1000:1000 /data/runs/ui/forge
+   docker exec open-sprite-object-forge sh -c \
+     'find /cache /data/runs /data/tmp /data/outputs ! -uid 1000 \
+        -exec chown -h 1000:1000 {} +'
    ```
 
-   **Durable fix (recommended, operator-gated):** run the container as the host
-   user so nothing is ever root-owned — add `user: "1000:1000"` to the forge
-   service in the compose file and recreate. Recreate is an operator step and
-   the image must be rebuilt from the committed tree; `docker cp` stays banned.
-   Until that lands, treat the chown as a required pre-approve step, not a
-   one-off.
+   `-h` matters: the HF cache under `/cache` is full of snapshot symlinks, and
+   a plain `chown -R` follows the link and fixes the blob while leaving the
+   link inode root-owned. The migration covers `/cache` deliberately — this
+   container also hosts the TRELLIS/SAM2 lane, which would otherwise lose write
+   access to its model cache.
+
+   Then recreate (an operator step; `docker cp` stays banned):
+
+   ```bash
+   cd deploy && docker compose --env-file open-sprite-trellis2.env \
+     -f docker-compose.interactive-gpu.yml up -d --force-recreate
+   ```
+
+   Verify: `docker exec open-sprite-object-forge id` reports `uid=1000`, and a
+   newly created job directory under
+   `<store>/assets/<asset>/variants/<variant>/jobs/` is owned by your user with
+   no chown run.
+
+   Historical symptoms, if you meet a deployment still running as root:
+   `PermissionError: ... /ui/forge/locks` (store root never chowned, bakes sit
+   in `queued_bake`) or `PermissionError: ... jobs/<id>/views_backup` (the job
+   directory is root-owned, so the job reaches `queued_bake` and then fails at
+   bake start). Re-running the chown per job is a stopgap, not a fix — the API
+   creates a fresh `jobs/<job_id>/` every time.
 
 4. Start **one** host worker. The repo `.venv` needs the existing project/API
    dependencies; the bake interpreter and Blender must already support the
