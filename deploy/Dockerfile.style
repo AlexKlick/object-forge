@@ -1,0 +1,6 @@
+FROM open-sprite-pipeline:trellis2-cu124
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN python -m pip install --no-cache-dir "diffusers==0.40.0" "huggingface-hub>=1.23,<2" "accelerate>=1.0" "python-multipart>=0.0.20"
+CMD ["python", "-m", "uvicorn", "open_sprite_pipeline.style_service:app", "--host", "0.0.0.0", "--port", "8056"]

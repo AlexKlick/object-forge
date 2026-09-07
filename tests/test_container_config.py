@@ -46,5 +46,54 @@ class ContainerConfigTests(unittest.TestCase):
         self.assertTrue(config["providers"]["trellis2"]["enabled"])
 
 
+class StyleServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.services = yaml.safe_load(
+            (ROOT / "deploy/docker-compose.interactive-gpu.yml").read_text())["services"]
+        self.service = self.services["object-forge-style"]
+
+    def test_user_loopback_and_only_gpu_one(self):
+        self.assertEqual(self.service["user"], "1000:1000")
+        self.assertEqual(self.service["ports"], ["127.0.0.1:8056:8056"])
+        self.assertEqual(self.service["gpus"], [
+            {"driver": "nvidia", "device_ids": ["1"], "capabilities": ["gpu"]}])
+        env = self.service["environment"]
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", env)
+        self.assertNotIn("NVIDIA_VISIBLE_DEVICES", env)
+        self.assertEqual(env["STYLE_DEVICE"], "cuda:0")
+
+    def test_cache_without_run_store(self):
+        self.assertEqual(self.service["volumes"], ["../.cache/trellis2-container:/cache"])
+        self.assertFalse(any("/data/runs" in mount for mount in self.service["volumes"]))
+        env = self.service["environment"]
+        self.assertEqual(env["HOME"], "/cache")
+        self.assertEqual(env["HF_HOME"], "/cache/huggingface")
+        self.assertEqual(env["HUGGINGFACE_HUB_CACHE"], "/cache/huggingface/hub")
+        self.assertEqual(env["TRITON_HOME"], "/cache/triton")
+        self.assertEqual(env["STYLE_MIN_FREE_MB"], "4500")
+        self.assertEqual(env["STYLE_IDLE_UNLOAD_S"], "180")
+        # Containers here have no DNS; models are pulled from the host and the
+        # sidecar must fail fast rather than hang on name resolution.
+        self.assertEqual(env["HF_HUB_OFFLINE"], "1")
+
+    def test_main_service_keeps_both_gpus_and_store(self):
+        main = self.services["object-forge"]
+        self.assertEqual(main["gpus"][0]["device_ids"], ["0", "1"])
+        self.assertEqual(main["user"], "1000:1000")
+        self.assertIn("../.runs/trellis2-container:/data/runs", main["volumes"])
+        self.assertEqual(main["environment"]["CUDA_VISIBLE_DEVICES"], "0,1")
+        self.assertEqual(main["environment"]["NVIDIA_VISIBLE_DEVICES"], "0,1")
+
+    def test_style_image_and_healthcheck(self):
+        self.assertEqual(self.service["build"],
+                         {"context": "..", "dockerfile": "deploy/Dockerfile.style"})
+        self.assertEqual(self.service["image"], "open-sprite-pipeline:style-cu124")
+        self.assertIn("http://127.0.0.1:8056/healthz", self.service["healthcheck"]["test"][-1])
+        dockerfile = (ROOT / "deploy/Dockerfile.style").read_text()
+        self.assertIn("diffusers==0.40.0", dockerfile)
+        self.assertIn("huggingface-hub>=1.23,<2", dockerfile)
+        self.assertIn("FROM open-sprite-pipeline:trellis2-cu124", dockerfile)
+
+
 if __name__ == "__main__":
     unittest.main()

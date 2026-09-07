@@ -75,3 +75,52 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  object-forge-style:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.style
+    image: open-sprite-pipeline:style-cu124
+    container_name: open-sprite-object-forge-style
+    init: true
+    restart: unless-stopped
+    # Match the host user so shared cache files remain host-writable.
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:8056:8056"
+    environment:
+      STYLE_BACKEND: diffusers
+      STYLE_DEVICE: cuda:0
+      STYLE_BASE_MODEL: stable-diffusion-v1-5/stable-diffusion-v1-5
+      STYLE_CONTROLNET: lllyasviel/control_v11f1p_sd15_depth
+      STYLE_IP_ADAPTER: h94/IP-Adapter
+      STYLE_MIN_FREE_MB: "4500"
+      STYLE_IDLE_UNLOAD_S: "180"
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      # Containers on this host have no working DNS (the embedded resolver
+      # cannot reach the external servers), so the sidecar can never download.
+      # Models are pulled from the HOST into the shared cache (see
+      # docs/STYLE_ENGINE.md); offline mode makes a missing model fail fast
+      # instead of hanging on name resolution.
+      HF_HUB_OFFLINE: "1"
+      HOME: /cache
+      TRITON_HOME: /cache/triton
+      HF_TOKEN: ${HF_TOKEN:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ../.cache/trellis2-container:/cache
+    gpus:
+      - driver: nvidia
+        device_ids: ["1"]
+        capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8056/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
