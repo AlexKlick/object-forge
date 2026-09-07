@@ -1,6 +1,7 @@
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
+from contextlib import redirect_stdout
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ from PIL import Image
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from open_sprite_pipeline.forge_worker import ForgeWorker, png, load_tool
+from open_sprite_pipeline.forge_worker import ForgeWorker, png, load_tool, main
 from open_sprite_pipeline.style_client import StyleClient, StyleBusy, StyleError
 import test_forge_generate_worker as fixture
 
@@ -90,6 +91,56 @@ class StyleWorkerTests(unittest.TestCase):
         ready = self.worker.run_next()
         self.assertEqual(ready['state'], 'ready')
         return self.store.get_version('a', 'v', ready['version_number'])
+
+    def test_catalog_startup_and_after_bake_read_only_with_bad_yaml(self):
+        (self.assets / 'specs/broken.yaml').write_text('asset: [unterminated')
+        (self.assets / 'prompts/broken.yaml').write_text('prompt: [unterminated')
+        # Fixture setup is finished; every worker action must preserve this tree.
+        self.before = self.snapshot()
+        output = StringIO()
+        with patch.dict(os.environ, {'FORGE_ONCE': '1', 'FORGE_CRITIC_ENABLED': '0'}), \
+                patch('open_sprite_pipeline.forge_worker.ForgeClient', return_value=self.client), \
+                patch('open_sprite_pipeline.forge_worker.ForgeWorker', return_value=self.worker), \
+                patch('open_sprite_pipeline.forge_worker.signal.signal'), redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        catalog = self.store.get_catalog()
+        self.assertEqual([spec['asset'] for spec in catalog['specs']], ['a', 'prop'])
+        self.assertEqual(catalog['specs'][0]['variants'], ['default', 'v'])
+        self.assertEqual(len(catalog['specs'][0]['views']), 7)
+        self.assertEqual(catalog['specs'][0]['views'], sorted(catalog['specs'][0]['views']))
+        self.assertEqual(catalog['prompts'], ['a'])
+        self.assertEqual(catalog['assets_root'], str(self.assets))
+        self.assertEqual([error['file'] for error in catalog['errors']], ['prompts/broken.yaml', 'specs/broken.yaml'])
+        self.assertTrue(all(error['error'] for error in catalog['errors']))
+        self.assertIn('CATALOG specs=2 prompts=1', output.getvalue())
+        self.create(palette_only='true')
+        staged = self.worker.run_next()
+        with redirect_stdout(output):
+            self.bake(staged)
+        self.assertEqual(output.getvalue().count('CATALOG specs=2 prompts=1'), 2)
+        refreshed = self.store.get_catalog()
+        self.assertNotEqual(refreshed['published_at'], catalog['published_at'])
+        self.assertEqual(refreshed['specs'], catalog['specs'])
+        self.assertEqual(self.snapshot(), self.before, 'SPIKE TREE CHANGED')
+
+    def test_catalog_publish_failure_is_nonfatal_at_startup_and_completion(self):
+        request = self.client.request
+        def unavailable(method, path, *args, **kwargs):
+            if path == '/worker/catalog':
+                raise OSError('API restarting')
+            return request(method, path, *args, **kwargs)
+        output = StringIO()
+        with patch.object(self.client, 'request', side_effect=unavailable), redirect_stdout(output):
+            with patch.dict(os.environ, {'FORGE_ONCE': '1', 'FORGE_CRITIC_ENABLED': '0'}), \
+                    patch('open_sprite_pipeline.forge_worker.ForgeClient', return_value=self.client), \
+                    patch('open_sprite_pipeline.forge_worker.ForgeWorker', return_value=self.worker), \
+                    patch('open_sprite_pipeline.forge_worker.signal.signal'):
+                self.assertEqual(main(), 0)
+            self.create(palette_only='true')
+            version = self.bake(self.worker.run_next())
+        self.assertEqual(version['number'], 1)
+        self.assertEqual(output.getvalue().count('CATALOG publish failed: OSError: API restarting'), 2)
+        self.assertEqual(self.snapshot(), self.before, 'SPIKE TREE CHANGED')
 
     def test_palette_only_seven_views_auto_staged_and_baked(self):
         created = self.create(palette_only='true')

@@ -169,6 +169,16 @@ The installed report omits it, so the worker extracts per-view silhouette IoUs
 from the harvested Blender log and the threshold from the read-only
 `SELFCHECK_THRESHOLD` constant in `tools/bake_views.py`.
 
+## Catalog publication
+
+At startup after the critic probe, and after `/worker/complete` successfully
+publishes each baked version, the worker reads the authored spec/prompt YAML
+files and posts `/v1/forge/worker/catalog`. Success logs
+`CATALOG specs=<n> prompts=<n>` to stdout. Malformed files become catalog
+`errors`; diagnostic strings are capped at 200 characters. A scan or HTTP
+publication failure logs `CATALOG publish failed: ...` and is nonfatal, including
+when the API is restarting. Catalog reads never modify the spike tree.
+
 ## Gen Ladder worker lanes
 
 **SE2 `from_spec` jobs** copy `<spike>/specs/<spec_asset>.yaml` and its optional
@@ -240,6 +250,8 @@ Additional routes below `/v1/forge`:
 
 | Method/path | Contract |
 | --- | --- |
+| `POST /worker/catalog` | Worker-authenticated catalog JSON: `specs` (asset, variants, views), `prompts`, `assets_root`, ISO-8601 `published_at`, optional per-file `errors`. Atomically replaces the API snapshot; no lease needed. |
+| `GET /catalog` | Public stored catalog; empty specs/prompts and null `published_at` until first publication. |
 | `GET /jobs/{id}/cutouts/{n}.png` | Proxy the UiAssetStore cutout at zero-based `segment_refs` index `n`; also used by blockout iteration. |
 | `GET /jobs/{id}/renders/{view}.png` | Read the job's retained canonical render. Worker POST to the same route uses raw PNG bytes, worker authentication and `X-Forge-Lease`. |
 | `GET /jobs/{id}/blockout` | Read review data; 404 before synthesis. |

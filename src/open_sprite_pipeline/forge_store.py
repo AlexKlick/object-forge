@@ -103,6 +103,58 @@ class ForgeStore:
     def _read(self, path: Path) -> Any:
         return json.loads(self._checked(path).read_text(encoding="utf-8"))
 
+    @locked
+    def save_catalog(self, payload) -> dict:
+        required = {"specs", "prompts", "assets_root", "published_at"}
+        if not isinstance(payload, dict) or not required <= payload.keys() or payload.keys() - required - {"errors"}:
+            raise ForgeStoreError("Invalid catalog fields.")
+
+        def string(value):
+            if not isinstance(value, str) or len(value) > 200:
+                raise ForgeStoreError("Catalog strings must be at most 200 characters.")
+            return value
+
+        def names(value):
+            if not isinstance(value, list):
+                raise ForgeStoreError("Catalog names must be lists.")
+            return sorted(self._name(string(name)) for name in value)
+
+        if (not isinstance(payload["specs"], list) or len(payload["specs"]) > 500
+                or not isinstance(payload["prompts"], list) or len(payload["prompts"]) > 500):
+            raise ForgeStoreError("Catalog permits at most 500 specs and 500 prompts.")
+        specs = []
+        for spec in payload["specs"]:
+            if not isinstance(spec, dict) or set(spec) != {"asset", "variants", "views"}:
+                raise ForgeStoreError("Invalid catalog spec.")
+            specs.append({"asset": self._name(string(spec["asset"])),
+                          "variants": names(spec["variants"]), "views": names(spec["views"])})
+        published_at = string(payload["published_at"])
+        try:
+            stamp = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                raise ValueError("Missing timezone")
+        except ValueError as exc:
+            raise ForgeStoreError("Catalog published_at must be an ISO-8601 timestamp with timezone.") from exc
+        result = {"specs": sorted(specs, key=lambda spec: (spec["asset"], spec["variants"], spec["views"])),
+                  "prompts": names(payload["prompts"]), "assets_root": string(payload["assets_root"]),
+                  "published_at": published_at}
+        if "errors" in payload:
+            if not isinstance(payload["errors"], list):
+                raise ForgeStoreError("Catalog errors must be a list.")
+            errors = []
+            for error in payload["errors"]:
+                if not isinstance(error, dict) or set(error) != {"file", "error"}:
+                    raise ForgeStoreError("Invalid catalog error.")
+                errors.append({key: string(error[key]) for key in ("file", "error")})
+            result["errors"] = sorted(errors, key=lambda error: (error["file"], error["error"]))
+        self._write_json(self.confined("catalog.json"), result)
+        return result
+
+    @locked
+    def get_catalog(self) -> dict:
+        path = self.confined("catalog.json")
+        return self._read(path) if path.exists() else {"specs": [], "prompts": [], "published_at": None}
+
     def _variant_dir(self, asset: str, variant: str) -> Path:
         return self.confined(Path("assets") / self._name(asset) / "variants" / self._name(variant))
 
@@ -195,7 +247,11 @@ class ForgeStore:
         style = self.validate_style(value.get("style"))
         if palette_only and style and style["enabled"]:
             raise ForgeStoreError("palette_only jobs cannot style")
-        return {"spec_asset": self._name(value.get("spec_asset", asset)), "palette_only": palette_only,
+        spec_asset = self._name(value.get("spec_asset", asset))
+        known = sorted({spec["asset"] for spec in self.get_catalog()["specs"]})
+        if known and spec_asset not in known:
+            raise ForgeStoreError(f"Unknown spec asset {spec_asset}; known: {', '.join(known)}")
+        return {"spec_asset": spec_asset, "palette_only": palette_only,
                 "style": style, "blockout": None, "regenerations": 0, "segment_refs": []}
 
     def validate_generate(self, value):

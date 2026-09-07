@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from collections import Counter
+from datetime import datetime, timezone
 from functools import partial
 import base64
 import fcntl
@@ -274,6 +275,42 @@ class ForgeWorker:
                           f"styled/{pair}/views", f"bakes/{pair}"):
             checked_path(root, ws.relative_to(root) / directory).mkdir(parents=True, exist_ok=True)
         return ws
+
+    def catalog(self) -> dict:
+        """Read authored metadata only; the API container cannot see this tree."""
+        specs, prompts, errors = [], [], []
+        for directory in ("specs", "prompts"):
+            for path in sorted((self.assets / directory).glob("*.yaml")):
+                try:
+                    data = yaml.safe_load(checked_path(self.assets, path.relative_to(self.assets)).read_bytes())
+                    if not isinstance(data, dict):
+                        raise ValueError("Expected a YAML mapping")
+                    if directory == "specs":
+                        variants, views = data.get("variants", {}), data["views"]
+                        asset = data.get("asset") or path.stem
+                        if (not isinstance(asset, str) or not isinstance(variants, dict)
+                                or not isinstance(views, (dict, list))
+                                or not all(isinstance(name, str) for name in [*variants, *views])):
+                            raise ValueError("Invalid spec asset, variants or views")
+                        specs.append({"asset": asset, "variants": sorted(variants), "views": sorted(views)})
+                    else:
+                        prompts.append(path.stem)
+                except Exception as exc:
+                    errors.append({"file": str(path.relative_to(self.assets))[:200], "error": str(exc)[:200]})
+        return {"specs": sorted(specs, key=lambda spec: (spec["asset"], spec["variants"], spec["views"])),
+                "prompts": sorted(prompts), "assets_root": str(self.assets),
+                "published_at": datetime.now(timezone.utc).isoformat(),
+                "errors": sorted(errors, key=lambda error: (error["file"], error["error"]))}
+
+    def publish_catalog(self):
+        try:
+            catalog = self.catalog()
+            result = self.client.request("POST", "/worker/catalog", catalog)
+            print(f"CATALOG specs={len(catalog['specs'])} prompts={len(catalog['prompts'])}", flush=True)
+            return result
+        except Exception as exc:
+            print(f"CATALOG publish failed: {type(exc).__name__}: {exc}", flush=True)
+            return None
 
     def run_next(self):
         # Workspace locks span every generating/staging/baking subprocess. Take
@@ -1094,6 +1131,7 @@ class ForgeWorker:
                 "job_id": job["id"], "lease_id": job["lease"]["lease_id"],
                 "artifacts": artifacts, "metrics": metrics})
             print(f"DONE ready job={job['id']} version=v{version['number']}", flush=True)
+            self.publish_catalog()
             return self.client.request("GET", f"/jobs/{job['id']}")
         except BaseException as exc:
             try:
@@ -1161,6 +1199,8 @@ def main() -> int:
         raise ValueError("FORGE_POLL_INTERVAL must be finite and positive.")
     client = ForgeClient(os.getenv("FORGE_API", "http://127.0.0.1:8070"), os.getenv("FORGE_WORKER_TOKEN", ""))
     worker = ForgeWorker(client, Path(os.getenv("FORGE_SPIKE_ASSETS", str(DEFAULT_SPIKE_ASSETS))))
+    worker.init_critic()  # Emits the existing CRITIC probe diagnostic.
+    worker.publish_catalog()
     if not once:
         # Model calls never occupy the pipeline loop, even when a bake arrives mid-review.
         Thread(target=worker.critic_loop, args=(Event(), interval), daemon=True).start()

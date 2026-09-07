@@ -45,6 +45,65 @@ class ForgeApiTests(unittest.TestCase):
         return create_app(config_path=ROOT / "configs/app.example.yaml", ui_root=ui,
                           segmenter=ColorFloodSegmenter(), allow_real_generation=False)
 
+    def catalog_payload(self):
+        return {"specs": [{"asset": "a", "variants": ["default", "v"], "views": ["front"]}],
+                "prompts": ["a"], "assets_root": "/host/assets", "published_at": "2026-09-07T12:00:00+00:00",
+                "errors": [{"file": "specs/broken.yaml", "error": "Invalid YAML"}]}
+
+    def test_catalog_auth_roundtrip_and_persistence(self):
+        empty = {"specs": [], "prompts": [], "published_at": None}
+        self.assertEqual(self.client.get('/v1/forge/catalog').json(), empty)
+        payload = self.catalog_payload()
+        with patch.dict(os.environ, {'FORGE_WORKER_TOKEN': 'catalog-test'}):
+            self.assertEqual(self.client.post('/v1/forge/worker/catalog', json=payload).status_code, 403)
+            response = self.client.post('/v1/forge/worker/catalog', json=payload,
+                                        headers={'X-Forge-Worker': 'catalog-test'})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), payload)
+            self.assertEqual(self.client.get('/v1/forge/catalog').json(), payload)
+        from open_sprite_pipeline.forge_store import ForgeStore
+        self.assertEqual(ForgeStore(self.store.root).get_catalog(), payload)
+        self.assertEqual(json.loads((self.store.root / 'catalog.json').read_text()), payload)
+        self.assertFalse((self.store.root / 'catalog.json.tmp').exists())
+
+    def test_catalog_rejects_bad_shapes_without_replacing_document(self):
+        payload = self.catalog_payload()
+        self.store.save_catalog(payload)
+        invalid = [[], {}, {**payload, 'extra': True}, {**payload, 'specs': [None]},
+                   {**payload, 'specs': payload['specs'] * 501}, {**payload, 'prompts': ['a'] * 501},
+                   {**payload, 'prompts': 'a'}, {**payload, 'prompts': ['../a']},
+                   {**payload, 'assets_root': 'a' * 201}, {**payload, 'published_at': None},
+                   {**payload, 'published_at': 'yesterday'}, {**payload, 'errors': {}},
+                   {**payload, 'errors': [{'file': 'bad', 'error': 'x' * 201}]},
+                   {**payload, 'errors': [{'file': 12, 'error': 'bad'}]}]
+        for key, value in [('asset', '../escape'), ('asset', 4), ('asset', 'x' * 201),
+                           ('variants', {}), ('variants', [3]), ('variants', ['../bad']),
+                           ('views', 'front'), ('views', ['../bad'])]:
+            invalid.append({**payload, 'specs': [{**payload['specs'][0], key: value}]})
+        for body in invalid:
+            with self.subTest(body=body):
+                self.assertEqual(self.client.post('/v1/forge/worker/catalog', json=body).status_code, 422)
+                self.assertEqual(self.store.get_catalog(), payload)
+
+    def test_from_spec_catalog_validation_allows_alias_and_empty_catalog(self):
+        fields = {'asset': 'alias', 'variant': 'undeclared', 'intent': 'from_spec',
+                  'spec_asset': 'other', 'palette_only': 'true'}
+        self.assertEqual(self.client.post('/v1/forge/jobs', data=fields).status_code, 201)
+        payload = self.catalog_payload()
+        payload['specs'].append({'asset': 'b', 'variants': [], 'views': ['front']})
+        self.store.save_catalog(payload)
+        before = len(self.store.list_jobs())
+        response = self.client.post('/v1/forge/jobs', data=fields)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()['detail'], 'Unknown spec asset other; known: a, b')
+        self.assertEqual(len(self.store.list_jobs()), before)
+        response = self.client.post('/v1/forge/jobs', data={**fields, 'spec_asset': 'a'})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()['asset'], 'alias')
+        self.assertEqual(response.json()['variant'], 'undeclared')
+        self.store.save_catalog({**payload, 'specs': []})
+        self.assertEqual(self.client.post('/v1/forge/jobs', data=fields).status_code, 201)
+
     def test_from_spec_style_refs_routes_auth_lease_and_validation(self):
         fields = {'asset': 'a', 'variant': 'v', 'intent': 'from_spec',
                   'style': '{"enabled": true}', 'canonical_views': '["front"]'}

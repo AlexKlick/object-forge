@@ -367,3 +367,17 @@ kbd { min-width: 44px; padding: 4px 6px; border: 1px solid var(--line-strong); b
 .critic-issues { padding-left: 1.25rem; }
 .critic-issues li { margin-block: 1rem; }
 .critic-excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Authored-spec styling and seed review. */
+#styleFields { margin-block: 18px; border: 1px solid var(--line); border-radius: 12px; }
+.forge-style-review { margin-block: 20px; min-width: 0; }
+.forge-style-row { display: flex; gap: 12px; overflow-x: auto; padding: 5px; }
+.forge-style-tile { flex: 0 0 172px; margin: 0; padding: 6px; border-radius: 8px; background: #ffffff05; }
+.forge-style-review img { display: block; width: 160px; max-width: 160px; height: 160px; object-fit: contain; }
+.forge-style-tile.is-chosen { outline: 2px solid #7be39a; }
+.forge-style-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-block: 8px; }
+.forge-style-chips .forge-badge { white-space: normal; overflow-wrap: anywhere; }
+.forge-style-artifact { max-width: 160px; max-height: 160px; object-fit: contain; }
+.forge-panel-list [data-decision=accept] { border-color: #7be39a; }
+.forge-panel-list [data-decision=reject] { border-color: #ff727c; }
+.forge-panel-list [aria-pressed=true] { outline: 2px solid #62a8ff; }

@@ -41,6 +41,107 @@ class ShellParser(HTMLParser):
 
 
 class ForgeUiTests(unittest.TestCase):
+    def test_authored_spec_style_form_review_and_version_seams(self):
+        source = (WEB / "forge.js").read_text()
+        for token in ('specToggle', 'specAsset', 'specVariant', 'specVariants', 'specPaletteOnly',
+                      'styleFields', 'styleEnabled', 'styleSeeds', 'styleStrength', 'styleIpScale',
+                      'styleControlScale', 'stylePrompt', 'style_refs[]', '"from_spec"', '${forge}/catalog',
+                      'No catalog published yet — start the host worker', 'Drop style references (≤ 6)',
+                      'body.append("spec_asset"', 'body.append("palette_only"', 'body.append("style"',
+                      'class StyleReview', 'choose(view, seed)', 'data-action="use-seed"',
+                      'Style candidates', 'panel.decision || "reject"', 'STYLE-TRUNCATED',
+                      'Authored spec — edit the blockout from the version instead',
+                      '"Style"', 'style/report.json', 'loading="lazy"',
+                      '<span class="forge-badge">styled</span>'):
+            self.assertIn(token, source)
+        blocks = ['<div class="forge-blockout-review"', '<div class="forge-style-review"', '<div class="forge-review"']
+        self.assertEqual(sorted(source.index(block) for block in blocks), [source.index(block) for block in blocks])
+        for token in ('.forge-style-review', '.forge-style-row', '.is-chosen', '.forge-style-chips'):
+            self.assertIn(token, (WEB / 'app.css').read_text())
+
+    @unittest.skipUnless(shutil.which('node'), 'node is required for JavaScript probes')
+    def test_style_seed_choice_preserves_other_views_and_predecisions(self):
+        source = (WEB / 'forge.js').read_text()
+        methods = source[source.index('  decision(panel) {'):source.index('  missing() {')]
+        probe = r'''
+const $ = () => ({checked: true});
+const panels = [
+  {panel_id: 'sfront-1-p0', source: 'style', style_view: 'front', seed: 1, decision: 'accept', view: 'front'},
+  {panel_id: 'sfront-2-p0', source: 'style', style_view: 'front', seed: 2, decision: 'reject', view: 'front'},
+  {panel_id: 'sback-1-p0', source: 'style', style_view: 'back', seed: 1, decision: 'accept', view: 'back'},
+  {panel_id: 'u0-p0', source: 'upload', decision: 'reject', view: 'front'},
+];
+const calls = [];
+const review = {job: {match: {panels}}, decisions: new Map(),
+  drawSelected() { calls.push('selected'); }, drawSheets() { calls.push('sheets'); },
+  coverage() { calls.push('coverage'); }, save() { calls.push('save'); },
+METHODS
+};
+if (panels.map(p => review.decision(p).decision).join() !== 'accept,reject,accept,reject') throw Error('Lost predecisions');
+review.choose('front', 2);
+if (panels.map(p => review.decision(p).decision).join() !== 'reject,accept,accept,reject') throw Error('Nonexclusive seed choice');
+if (review.decision(panels[1]).view !== 'front' || review.selected !== panels[1]) throw Error('Wrong selected view');
+if (calls.join() !== 'selected,sheets,coverage,save') throw Error('Draft refresh/save missing');
+review.submitting = true; review.choose('front', 1);
+if (review.decision(panels[1]).decision !== 'accept') throw Error('Changed a submitting review');
+console.log('Seed decision probe passed');
+'''.replace('METHODS', methods.replace('\n  }', '\n  },'))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'seed-probe.log'
+            with path.open('w') as log:
+                result = subprocess.run(['node', '--input-type=module'], input=probe, text=True,
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=15)
+            self.assertEqual(result.returncode, 0, path.read_text())
+
+    @unittest.skipUnless(shutil.which('node'), 'node is required for JavaScript probes')
+    def test_style_multipart_modes_and_palette_only_guard(self):
+        source = (WEB / 'forge.js').read_text()
+        method = source[source.index('  async create() {'):source.index('  card(job) {')]
+        probe = r'''
+let fields, sent;
+const $ = (selector) => fields[selector];
+const forge = '/v1/forge';
+const toast = () => {};
+const api = async (path, options) => { sent = options.body; return {}; };
+const board = {root: {querySelectorAll: () => []}, files: ['photo'], segmentRefs: new Map(),
+  replacements: new Map(), styleRefs: ['reference'], card() {},
+METHOD
+};
+async function run(intent, {palette = false, enabled = true, prompt = ''} = {}) {
+  sent = null;
+  fields = {'button[type=submit]': {}, '#forgeFormError': {},
+    '#iterateToggle': {checked: false}, '#generateToggle': {checked: intent === 'generate'},
+    '#specToggle': {checked: intent === 'from_spec'}, '#specAsset': {value: 'authored'},
+    '[name=asset]': {value: 'alias'}, '[name=variant]': {value: 'photo_variant'}, '#specVariant': {value: 'undeclared'},
+    '#specPaletteOnly': {checked: palette}, '#styleFields': {hidden: palette || intent === 'fresh'},
+    '#styleEnabled': {checked: enabled}, '#styleSeeds': {value: '3'}, '#styleStrength': {value: '0.62'},
+    '#styleIpScale': {value: '0.6'}, '#styleControlScale': {value: '0.8'}, '#stylePrompt': {value: prompt},
+    '#generateHeightHint': {value: '12'}, '#generateFloorHeight': {value: '3'}};
+  await board.create();
+  if (!sent) throw Error(fields['#forgeFormError'].textContent || 'No request');
+}
+await run('from_spec');
+if (sent.get('intent') !== 'from_spec' || sent.get('asset') !== 'alias' || sent.get('spec_asset') !== 'authored' || sent.get('variant') !== 'undeclared') throw Error('Spec identity/alias lost');
+if (sent.has('files') || sent.get('palette_only') !== 'false' || sent.getAll('style_refs[]').length !== 1) throw Error('Wrong spec uploads');
+let style = JSON.parse(sent.get('style'));
+if (style.seeds_per_view !== 3 || style.strength !== 0.62 || style.ip_scale !== 0.6 || style.control_scale !== 0.8 || 'prompt_override' in style) throw Error('Wrong style settings');
+await run('from_spec', {palette: true});
+if (sent.has('style') || sent.has('style_refs[]') || sent.get('palette_only') !== 'true') throw Error('Palette-only leaked style');
+await run('from_spec', {enabled: false});
+if (sent.has('style') || sent.has('style_refs[]')) throw Error('Disabled style leaked');
+await run('generate', {prompt: '  Painted workshop  '});
+if (JSON.parse(sent.get('style')).prompt_override !== 'Painted workshop' || sent.get('files') !== 'photo' || sent.has('spec_asset')) throw Error('Wrong generate payload');
+await run('fresh');
+if (sent.has('style') || sent.has('style_refs[]') || sent.get('files') !== 'photo') throw Error('Fresh job leaked style');
+console.log('Multipart mode probe passed');
+'''.replace('METHOD', method)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'multipart-probe.log'
+            with path.open('w') as log:
+                result = subprocess.run(['node', '--input-type=module'], input=probe, text=True,
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=15)
+            self.assertEqual(result.returncode, 0, path.read_text())
+
     def test_edit_blockout_gating_form_and_inherited_review_sources(self):
         source = (WEB / "forge.js").read_text()
         self.assertIn('version.artifacts.includes("blockout/spec.yaml") ? button("Edit blockout", "edit-blockout"', source)

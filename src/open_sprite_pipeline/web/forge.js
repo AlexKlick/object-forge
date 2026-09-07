@@ -24,9 +24,9 @@ function showTab(name) {
 }
 
 // Shared click/drop control: local object URLs are released when a file is removed.
-function dropzone(container, changed, { multiple = true, title = "Drop sheets here or click to browse" } = {}) {
+function dropzone(container, changed, { multiple = true, title = "Drop sheets here or click to browse", maxFiles = 8 } = {}) {
   let items = [];
-  container.innerHTML = `<label class="forge-drop"><strong>${esc(title)}</strong><small>PNG, JPEG, WebP, GIF · up to 8 images, 20 MiB each</small><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" ${multiple ? "multiple" : ""}></label><div class="forge-thumbnails"></div>`;
+  container.innerHTML = `<label class="forge-drop"><strong>${esc(title)}</strong><small>PNG, JPEG, WebP, GIF · up to ${maxFiles} images, 20 MiB each</small><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" ${multiple ? "multiple" : ""}></label><div class="forge-thumbnails"></div>`;
   const input = $("input", container);
   const render = () => {
     $(".forge-thumbnails", container).innerHTML = items.map((item, index) => `<figure><img src="${item.url}" alt="${esc(item.file.name)}"><figcaption>${esc(item.file.name)}</figcaption><button type="button" class="button ghost" data-remove="${index}" aria-label="Remove ${esc(item.file.name)}">Remove</button></figure>`).join("");
@@ -38,7 +38,7 @@ function dropzone(container, changed, { multiple = true, title = "Drop sheets he
     if (selected.some((file) => !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type) || !file.size || file.size > 20 * 1024 * 1024)) {
       toast("Choose nonempty images of at most 20 MiB each.", true); return;
     }
-    if (multiple && items.length + selected.length > 8) { toast("Upload at most eight images.", true); return; }
+    if (multiple && items.length + selected.length > maxFiles) { toast(`Upload at most ${maxFiles} images.`, true); return; }
     if (!multiple) clear();
     items.push(...(multiple ? selected : selected.slice(0, 1)).map((file) => ({ file, url: URL.createObjectURL(file) })));
     render();
@@ -59,6 +59,7 @@ class BoardView {
   constructor(root) {
     this.root = root;
     this.files = [];
+    this.styleRefs = [];
     this.segmentRefs = new Map();
     this.replacements = new Map();
     this.slots = [];
@@ -71,6 +72,12 @@ class BoardView {
         <label>Variant<input name="variant" required class="text-control" list="forgeVariants" placeholder="variant id"></label><datalist id="forgeVariants"></datalist></div>
         <label class="forge-check"><input id="iterateToggle" type="checkbox"> Iterate an existing version</label>
         <label class="forge-check"><input id="generateToggle" type="checkbox"> Generate blockout from photos</label>
+        <label class="forge-check"><input id="specToggle" type="checkbox"> From authored spec</label>
+        <div id="specFields" hidden><div class="forge-fields">
+          <label>Authored spec<select id="specAsset" class="select-control" required disabled></select></label>
+          <label>Variant<input id="specVariant" list="specVariants" class="text-control" value="default" required disabled></label><datalist id="specVariants"></datalist></div>
+          <p id="specCatalogEmpty" class="microcopy" hidden>No catalog published yet — start the host worker</p>
+          <label class="forge-check"><input id="specPaletteOnly" type="checkbox"> Palette only (no styling, zero-panel review)</label></div>
         <div id="generateFields" hidden><div class="forge-fields">
           <label>Height hint (m)<input id="generateHeightHint" type="number" min="1" max="300" step="any" value="12" class="text-control"></label>
           <label>Floor height (m)<input id="generateFloorHeight" type="number" min="1" max="10" step="any" value="3" class="text-control"></label></div>
@@ -80,23 +87,45 @@ class BoardView {
         <div id="iterateFields" hidden><div class="forge-fields"><label>Parent version<select id="parentVersion" class="select-control"><option value="">Choose a library version</option></select></label>
         <label>Intent<select id="iterateIntent" class="select-control"><option value="iterate_views">iterate_views</option><option value="iterate_params">iterate_params</option></select></label></div><div id="replacementSlots" class="forge-slots"></div></div>
         <div id="freshUploads"></div>
+        <fieldset id="styleFields" hidden disabled><legend>Style</legend>
+          <label class="forge-check"><input id="styleEnabled" type="checkbox" checked> Enable styling</label>
+          <div id="styleReferences"></div><div class="forge-fields">
+          <label>Seeds per view<input id="styleSeeds" type="number" min="1" max="6" step="1" value="3" required class="text-control"></label>
+          <label>Strength<input id="styleStrength" type="number" min="0.2" max="0.95" step="0.01" value="0.62" required class="text-control"></label>
+          <label>Reference scale<input id="styleIpScale" type="number" min="0" max="1.5" step="0.01" value="0.6" required class="text-control"></label>
+          <label>Control scale<input id="styleControlScale" type="number" min="0" max="1.5" step="0.01" value="0.8" required class="text-control"></label>
+          <label>Prompt<input id="stylePrompt" type="text" maxlength="400" placeholder="Optional prompt override" class="text-control"></label></div></fieldset>
         <details class="forge-advanced"><summary>Advanced parameters</summary><div class="forge-fields">
           ${[["iou", .70], ["margin", .05], ["ownership_min", .5], ["view_iou_warn", .90], ["view_iou_fail", ""], ["atlas_tile", 1024], ["turntable", 8]].map(([name, value]) => `<label>${name}<input name="${name}" type="number" class="text-control" min="${name === "atlas_tile" ? 1 : 0}" ${["atlas_tile", "turntable"].includes(name) ? 'step="1"' : 'max="1" step="0.01"'} value="${value}" ${name === "view_iou_fail" ? 'placeholder="disabled"' : "required"}></label>`).join("")}
           <label class="forge-check"><input name="allow_extra" type="checkbox"> allow_extra</label></div></details>
         <button class="button primary" type="submit">Create job →</button><p id="forgeFormError" class="forge-error" role="alert"></p>
       </form><div id="forgeJobs" class="forge-jobs" aria-live="polite"></div>`;
     this.uploads = dropzone($("#freshUploads"), (files) => { this.files = files; });
+    this.styleUploads = dropzone($("#styleReferences"), (files) => { this.styleRefs = files; }, { title: "Drop style references (≤ 6)", maxFiles: 6 });
     $("#iterateToggle").addEventListener("change", () => {
-      if ($("#iterateToggle").checked) $("#generateToggle").checked = false;
+      if ($("#iterateToggle").checked) { $("#generateToggle").checked = false; $("#specToggle").checked = false; }
       this.mode();
     });
     $("#generateToggle").addEventListener("change", () => {
       if ($("#generateToggle").checked) {
         $("#iterateToggle").checked = false;
+        $("#specToggle").checked = false;
         if (!$('[name=variant]', root).value) $('[name=variant]', root).value = "default";
       }
       this.mode();
     });
+    $("#specToggle").addEventListener("change", guard(async () => {
+      if ($("#specToggle").checked) { $("#iterateToggle").checked = false; $("#generateToggle").checked = false; }
+      this.mode();
+      if ($("#specToggle").checked) {
+        // The worker may publish its catalog after this page loaded; refresh on entry.
+        await this.refreshPickers();
+        this.selectSpec();
+      }
+    }));
+    $("#specAsset").onchange = () => this.selectSpec();
+    $("#specPaletteOnly").onchange = () => this.mode();
+    $("#styleEnabled").onchange = () => this.mode();
     $("#generateLatestCutouts").onclick = guard(() => this.latestCutouts());
     $("#iterateIntent").addEventListener("change", () => this.mode());
     $("#parentVersion").addEventListener("change", guard(() => this.selectParent()));
@@ -125,7 +154,12 @@ class BoardView {
   }
 
   async refreshPickers() {
-    [this.assets, this.parents] = await Promise.all([api(`${forge}/assets`), api(`${forge}/library`)]);
+    [this.assets, this.parents, this.catalog] = await Promise.all([api(`${forge}/assets`), api(`${forge}/library`), api(`${forge}/catalog`)]);
+    const specAsset = $("#specAsset").value;
+    $("#specAsset").innerHTML = '<option value="">Choose an authored spec</option>' + this.catalog.specs.map((spec) => `<option value="${esc(spec.asset)}">${esc(spec.asset)}</option>`).join("");
+    $("#specAsset").value = specAsset;
+    $("#specCatalogEmpty").hidden = this.catalog.specs.length > 0;
+    this.specVariants();
     this.parents = this.parents.filter((v) => v.origin !== "trellis" && v.job_id);
     $("#forgeAssets").innerHTML = [...new Set(this.assets.map((entry) => entry.asset))].map((asset) => `<option value="${esc(asset)}"></option>`).join("");
     this.variants();
@@ -139,11 +173,31 @@ class BoardView {
     $("#forgeVariants").innerHTML = (this.assets || []).filter((entry) => entry.asset === asset).map((entry) => `<option value="${esc(entry.variant)}"></option>`).join("");
   }
 
+  specVariants() {
+    const spec = this.catalog?.specs.find((spec) => spec.asset === $("#specAsset").value);
+    $("#specVariants").innerHTML = (spec?.variants || []).map((variant) => `<option value="${esc(variant)}"></option>`).join("");
+  }
+
+  selectSpec() {
+    if ($("#specAsset").value) $("[name=asset]", this.root).value = $("#specAsset").value;
+    this.specVariants(); this.variants();
+  }
+
   mode() {
     const iterate = $("#iterateToggle").checked;
+    const spec = $("#specToggle").checked;
+    $("#specFields").hidden = !spec;
+    $("#specAsset").disabled = $("#specVariant").disabled = !spec;
+    $("[name=variant]", this.root).disabled = spec;
+    $("[name=variant]", this.root).closest("label").hidden = spec;
+    const styleFields = $("#styleFields");
+    styleFields.hidden = !$("#generateToggle").checked && !(spec && !$("#specPaletteOnly").checked);
+    styleFields.disabled = styleFields.hidden;
+    for (const input of styleFields.querySelectorAll("input:not(#styleEnabled)")) input.disabled = !$("#styleEnabled").checked;
     $("#iterateFields").hidden = !iterate;
     $("#generateFields").hidden = !$("#generateToggle").checked;
-    $("#freshUploads").hidden = iterate;
+    for (const input of $("#generateFields").querySelectorAll("input")) input.disabled = $("#generateFields").hidden;
+    $("#freshUploads").hidden = iterate || spec;
     $("#replacementSlots").hidden = $("#iterateIntent").value !== "iterate_views";
     for (const name of ["asset", "variant"]) $(`[name=${name}]`, this.root).readOnly = iterate;
   }
@@ -199,6 +253,7 @@ class BoardView {
     await this.refreshPickers();
     $("#iterateToggle").checked = true;
     $("#generateToggle").checked = false;
+    $("#specToggle").checked = false;
     $("#parentVersion").value = version.job_id;
     await this.selectParent();
     this.root.scrollIntoView({ behavior: "smooth" });
@@ -209,16 +264,28 @@ class BoardView {
     submit.disabled = true; $("#forgeFormError").textContent = "";
     try {
       const iterate = $("#iterateToggle").checked;
-      const intent = iterate ? $("#iterateIntent").value : $("#generateToggle").checked ? "generate" : "fresh";
+      const intent = iterate ? $("#iterateIntent").value : $("#generateToggle").checked ? "generate" : $("#specToggle").checked ? "from_spec" : "fresh";
       if (iterate && !this.parent) throw new Error("Choose a parent version first.");
       const pairs = intent === "iterate_views" ? [...this.replacements] : [];
-      const files = iterate ? pairs.map(([, file]) => file) : this.files;
+      const files = iterate ? pairs.map(([, file]) => file) : intent === "from_spec" ? [] : this.files;
       const refs = intent === "generate" ? [...this.segmentRefs.values()] : [];
-      if ((!files.length && !refs.length && intent !== "iterate_params") || files.length > 8) throw new Error("Choose between one and eight images.");
+      if ((!files.length && !refs.length && !["iterate_params", "from_spec"].includes(intent)) || files.length > 8) throw new Error("Choose between one and eight images.");
       if (intent === "generate" && files.length + refs.length > 7) throw new Error("Choose at most seven photos/cutouts in total.");
       const body = new FormData();
-      for (const name of ["asset", "variant"]) body.append(name, $(`[name=${name}]`, this.root).value.trim());
+      for (const name of ["asset", "variant"]) body.append(name, (intent === "from_spec" && name === "variant" ? $("#specVariant") : $(`[name=${name}]`, this.root)).value.trim());
       body.append("intent", intent);
+      if (intent === "from_spec") {
+        if (!$("#specAsset").value) throw new Error("Choose an authored spec first.");
+        body.append("spec_asset", $("#specAsset").value);
+        body.append("palette_only", String($("#specPaletteOnly").checked));
+      }
+      if (["generate", "from_spec"].includes(intent) && !$("#styleFields").hidden && $("#styleEnabled").checked) {
+        const style = { enabled: true, seeds_per_view: Number($("#styleSeeds").value), strength: Number($("#styleStrength").value),
+          ip_scale: Number($("#styleIpScale").value), control_scale: Number($("#styleControlScale").value) };
+        const prompt = $("#stylePrompt").value.trim(); if (prompt) style.prompt_override = prompt;
+        body.append("style", JSON.stringify(style));
+        for (const file of this.styleRefs) body.append("style_refs[]", file);
+      }
       if (intent === "generate") {
         body.append("segment_refs", JSON.stringify(refs));
         body.append("height_hint", $("#generateHeightHint").value);
@@ -242,17 +309,32 @@ class BoardView {
     let card = this.jobs.get(job.id);
     if (!card) {
       const root = document.createElement("article"); root.className = "forge-surface forge-job";
-      root.innerHTML = `<div class="forge-heading"><h2>${esc(job.asset)} / ${esc(job.variant)}</h2><span class="forge-state"></span></div><small>${esc(job.id)} · ${esc(job.intent)}</small><pre class="forge-log" aria-label="Worker marker log"></pre><p class="forge-error" role="alert"></p><div class="forge-job-actions"></div><div class="forge-blockout-review" hidden></div><div class="forge-review" hidden></div>`;
+      root.innerHTML = `<div class="forge-heading"><h2>${esc(job.asset)} / ${esc(job.variant)}</h2><span class="forge-state"></span></div><small>${esc(job.id)} · ${esc(job.intent)}</small><pre class="forge-log" aria-label="Worker marker log"></pre><p class="forge-error" role="alert"></p><div class="forge-job-actions"></div><div class="forge-blockout-review" hidden></div><div class="forge-style-review" hidden></div><div class="forge-review" hidden></div>`;
       $("#forgeJobs").prepend(root); card = { root, log: [], job }; this.jobs.set(job.id, card);
+      $(".forge-review", root).addEventListener("forge:decisions", () => card.style?.drawChosen());
     }
     card.job = job;
     const blockoutRoot = $(".forge-blockout-review", card.root);
-    blockoutRoot.hidden = !["generate", "iterate_blockout"].includes(job.intent) || job.state !== "review" || !job.generate?.blockout;
+    blockoutRoot.hidden = !(["generate", "iterate_blockout"].includes(job.intent) || job.intent === "from_spec") || job.state !== "review" || !job.generate?.blockout;
     const revision = `${job.generate?.regenerations}:${job.state}:${!!job.match.submitted}`;
     if (card.revision !== revision) {
       card.review = null;
       if (!blockoutRoot.hidden) card.blockout = new BlockoutReview(blockoutRoot, job, (updated) => this.card(updated), () => card.review);
       card.revision = revision;
+    }
+    const review = () => {
+      if (!card.review) card.review = new MatchReview($(".forge-review", card.root), card.job, (updated) => this.card(updated));
+      $(".forge-review", card.root).hidden = false;
+      return card.review;
+    };
+    const styleRoot = $(".forge-style-review", card.root);
+    styleRoot.hidden = !job.style || job.state !== "review" || job.match.submitted;
+    if (!styleRoot.hidden) {
+      const styleRevision = `${revision}:${JSON.stringify(job.style)}`;
+      if (card.styleRevision !== styleRevision) {
+        card.style = new StyleReview(styleRoot, job, (panel) => card.review?.decision(panel), review);
+        card.styleRevision = styleRevision;
+      } else { card.style.job = job; card.style.drawChosen(); }
     }
     const chip = $(".forge-state", card.root); chip.textContent = job.state; chip.dataset.state = job.state;
     const lines = job.worker_log || [];
@@ -272,8 +354,7 @@ class BoardView {
     actions.onclick = guard(async (event) => {
       const action = event.target.closest("[data-action]")?.dataset.action;
       if (action === "review") {
-        if (!card.review) card.review = new MatchReview($(".forge-review", card.root), job, (updated) => this.card(updated));
-        $(".forge-review", card.root).hidden = false;
+        review();
       }
       if (action === "approve") this.card(await api(`${forge}/jobs/${job.id}/approve`, { method: "POST" }));
       if (action === "version") { showTab("library"); await detail.open({ ...job, number: job.version_number }); }
@@ -322,8 +403,11 @@ class BlockoutReview {
     render();
     $("[data-action=previous]", root).onclick = () => { index = (index + blockout.views.length - 1) % blockout.views.length; render(); };
     $("[data-action=next]", root).onclick = () => { index = (index + 1) % blockout.views.length; render(); };
-    if (job.intent === "iterate_blockout") {
+    if (job.intent === "iterate_blockout" || job.intent === "from_spec") {
       $("fieldset", root).remove();
+      if (job.intent === "from_spec") {
+        const note = document.createElement("p"); note.textContent = "Authored spec — edit the blockout from the version instead"; root.append(note);
+      }
       return;
     }
     const regenerate = $("[data-action=regenerate]", root);
@@ -353,6 +437,39 @@ class BlockoutReview {
   }
 }
 
+class StyleReview {
+  constructor(root, job, updated, review) {
+    this.root = root; this.job = job; this.updated = updated;
+    const tokens = Object.values(job.style.prompt_tokens || {}).filter(Number.isFinite);
+    const range = tokens.length ? `${Math.min(...tokens)}–${Math.max(...tokens)}` : "unavailable";
+    root.innerHTML = `<h3>Style: ${esc(job.style.model)} · refs ${esc(job.style.refs)} · tokens per view ${range}</h3>
+      ${(job.worker_log || []).some((line) => line.includes("STYLE-TRUNCATED")) ? '<p class="forge-error">STYLE-TRUNCATED: a style prompt exceeded the model token limit. Check the worker log.</p>' : ""}
+      ${job.canonical_views.map((view) => `<section><h4>${esc(view)}</h4><div class="forge-style-row">
+        <figure class="forge-style-tile"><img src="${forge}/jobs/${job.id}/renders/${encode(view)}.png" loading="lazy" alt="${esc(view)} blockout"><figcaption>Blockout</figcaption></figure>
+        ${(job.style.views[view]?.seeds || []).map((seed) => {
+          const entry = job.style.views[view].metrics[seed] || {}; const metrics = entry.metrics || {};
+          return `<figure class="forge-style-tile" data-view="${esc(view)}" data-seed="${seed}">
+            <img src="${forge}/jobs/${job.id}/style/${encode(view)}/${seed}.png" loading="lazy" alt="${esc(view)} seed ${seed}">
+            <figcaption class="forge-style-chips">${[`seed ${seed}`, `pass ${metrics.pass ? "✓" : "✗"}`, `drift ${metrics.palette_drift ?? "unavailable"}`, `change ${metrics.change ?? "unavailable"}`, `detail ${metrics.detail_gain ?? "unavailable"}`, `checks ${entry.checks?.pass ? "✓" : "✗"}`].map((chip) => `<span class="forge-badge">${esc(chip)}</span>`).join("")}</figcaption>
+            <button type="button" class="button secondary" data-action="use-seed" data-view="${esc(view)}" data-seed="${seed}">Use this seed</button></figure>`;
+        }).join("")}</div></section>`).join("")}`;
+    root.onclick = guard((event) => {
+      const target = event.target.closest('[data-action="use-seed"]'); if (!target) return;
+      review().choose(target.dataset.view, Number(target.dataset.seed));
+      this.drawChosen();
+    });
+    this.drawChosen();
+  }
+
+  drawChosen() {
+    for (const tile of this.root.querySelectorAll("figure[data-seed]")) {
+      const panel = this.job.match.panels.find((panel) => panel.source === "style" && panel.style_view === tile.dataset.view && panel.seed === Number(tile.dataset.seed));
+      const decision = panel && (this.updated(panel) || this.job.match.decisions.find((decision) => decision.panel_id === panel.panel_id) || panel);
+      tile.classList.toggle("is-chosen", !!decision && decision.decision !== "reject" && decision.view === tile.dataset.view);
+    }
+  }
+}
+
 class MatchReview {
   constructor(root, job, updated) {
     this.root = root; this.job = job; this.updated = updated;
@@ -369,6 +486,18 @@ class MatchReview {
     return this.decisions.get(panel.panel_id) || { panel_id: panel.panel_id, decision: panel.decision || "reject", view: panel.auto_view || panel.view || null, iou: panel.iou ?? null };
   }
 
+  choose(view, seed) {
+    if (this.submitting) return;
+    const selected = this.job.match.panels.find((panel) => panel.source === "style" && panel.style_view === view && panel.seed === seed);
+    if (!selected) throw new Error("Style seed is unavailable.");
+    for (const panel of this.job.match.panels.filter((panel) => panel.source === "style" && panel.style_view === view)) {
+      this.decisions.set(panel.panel_id, { panel_id: panel.panel_id, decision: panel === selected ? "accept" : "reject", view: panel === selected ? view : null, iou: panel.iou ?? null });
+    }
+    this.selected = selected;
+    $(".missing-ack", this.root).checked = false;
+    this.drawSelected(); this.drawSheets(); this.coverage(); this.save();
+  }
+
   missing() {
     const covered = new Set(this.job.inputs?.parent_views_inherited || []);
     for (const panel of this.job.match.panels) { const p = this.decision(panel); if (p.decision !== "reject") covered.add(p.view); }
@@ -382,6 +511,18 @@ class MatchReview {
   }
 
   async loadSheets() {
+    const stylePanels = this.job.match.panels.filter((panel) => panel.source === "style");
+    if (stylePanels.length) {
+      const section = document.createElement("section"); section.innerHTML = '<h4>Style candidates</h4><div class="forge-panel-list"></div>';
+      for (const panel of stylePanels) {
+        const select = document.createElement("button"); select.type = "button"; select.className = "button ghost";
+        select.textContent = `${panel.style_view} · seed ${panel.seed}`; select.dataset.panelId = panel.panel_id;
+        select.onclick = () => { this.selected = panel; this.drawSelected(); this.drawSheets(); };
+        $(".forge-panel-list", section).append(select);
+      }
+      $(".forge-sheets", this.root).append(section);
+      this.drawSheets();
+    }
     const sources = [
       ...(this.job.inputs?.parent_uploads || []).map((index) => ({ index, filename: `Parent photo ${index + 1}`, job_id: this.job.parent_job, route: `uploads/${index}`, key: "parent_upload_index" })),
       ...this.job.uploads.map((upload) => ({ ...upload, route: `uploads/${upload.index}`, key: "upload_index" })),
@@ -413,6 +554,12 @@ class MatchReview {
   }
 
   drawSheets() {
+    this.root.dispatchEvent(new Event("forge:decisions"));
+    for (const button of this.root.querySelectorAll("[data-panel-id]")) {
+      const panel = this.job.match.panels.find((panel) => panel.panel_id === button.dataset.panelId);
+      button.setAttribute("aria-pressed", String(panel === this.selected));
+      button.dataset.decision = this.decision(panel).decision;
+    }
     for (const { canvas, image, panels } of this.sheets) {
       if (!image.complete || !image.naturalWidth) continue;
       const ctx = canvas.getContext("2d"); ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(image, 0, 0);
@@ -503,6 +650,7 @@ class LibraryView {
         const frame = version.artifacts?.find((name) => name.startsWith("turntable/") && name.endsWith(".png")) || (version.metrics.turntable_frames ? "turntable/tt_00.png" : null);
         card.innerHTML = `${frame ? `<img src="${artifactPath(version, frame)}" alt="First turntable frame" loading="lazy">` : '<div class="forge-no-thumb">No turntable</div>'}<strong>${version.accepted ? "★ " : ""}v${version.number}</strong><span class="forge-badge">${esc(version.origin)}</span><span class="forge-lineage">${lineage(version)}</span><small>${esc(version.state || "ready")}</small>`;
         card.innerHTML += criticBadge(version.critic?.status);
+        if (version.style || version.metrics?.style) card.innerHTML += '<span class="forge-badge">styled</span>';
         card.onclick = guard(() => detail.open(version)); $(".forge-version-grid", section).append(card);
       }
     }
@@ -611,6 +759,8 @@ class VersionDetail {
     }
     if (request !== this.request) return;
     $(".detail-blockout-edit", this.root).replaceChildren();
+    this.styleReport = null;
+    $(".forge-subtabs", this.root).innerHTML = ["Bake report", "Views", ...(version.metrics.style ? ["Style"] : []), "History", "Critic"].map((name) => button(name, name)).join("");
     this.version = version; this.job = job; this.report = report; this.harmonize = harmonize; this.chain = chain;
     this.root.hidden = false;
     $(".detail-title", this.root).textContent = `${version.asset} / ${version.variant} · ${lineage(version)}`;
@@ -664,6 +814,10 @@ class VersionDetail {
     clearTimeout(this.criticTimer);
     for (const tab of this.root.querySelectorAll(".forge-subtabs button")) tab.setAttribute("aria-pressed", String(tab.dataset.action === name));
     const content = $(".detail-content", this.root); const v = this.version;
+    if (name === "Style" && v.metrics.style) {
+      this.showStyle();
+      return;
+    }
     if (name === "Critic") {
       content.textContent = "Loading critic…";
       this.showCritic().catch((error) => {
@@ -685,6 +839,20 @@ class VersionDetail {
       }
       content.innerHTML = `<p class="forge-lineage">${this.chain.map((v) => `v${v.number}`).join(" ← ")} · root v${v.lineage.root_version}</p><p>Created: ${esc(v.created_at)}<br>Job updated: ${esc(this.job.updated_at || "unavailable")}</p>${this.job.history_error ? `<p class="forge-error">Job history unavailable: ${esc(this.job.history_error)}</p>` : ""}<h4>Notes</h4>${[...(this.job.notes || []), ...v.notes].map((note) => `<blockquote><p>${esc(note.text)}</p><small>${esc(note.author)} · ${esc(note.at)}</small></blockquote>`).join("") || "<p>No notes yet.</p>"}<h4>Job decisions and inputs</h4><pre>${pretty({ intent: this.job.intent, decisions: this.job.match?.decisions, inputs: v.inputs })}</pre><h4>Lineage dates</h4><pre>${pretty(this.chain.map((v) => ({ version: v.number, job: v.job_id, created_at: v.created_at })))}</pre>`;
     }
+  }
+
+  async showStyle() {
+    const version = this.version; const style = version.metrics.style;
+    const content = $(".detail-content", this.root);
+    content.innerHTML = `<p>Model: ${esc(style.model)} · refs ${esc(style.refs)}</p><p>prompt_tokens: ${esc(JSON.stringify(style.prompt_tokens))}</p>
+      ${Object.entries(style.views).map(([view, entry]) => `<section><h4>${esc(view)}</h4><table><thead><tr>${["Chosen seed", "pass", "palette_drift", "change", "detail_gain"].map((key) => `<th>${esc(key)}</th>`).join("")}</tr></thead>
+      <tbody><tr>${["seed", "pass", "palette_drift", "change", "detail_gain"].map((key) => `<td>${esc(entry[key] ?? "unavailable")}</td>`).join("")}</tr></tbody></table>
+      <img class="forge-style-artifact" src="${artifactPath(version, `style/${view}/${entry.seed}.png`)}" loading="lazy" alt="${esc(view)} chosen seed ${esc(entry.seed)}"></section>`).join("")}
+      <details><summary>Full style/report.json</summary><pre class="style-report">Loading…</pre></details>`;
+    // Fetch only on opening Style, and reuse the result until another version opens.
+    if (!this.styleReport) this.styleReport = api(artifactPath(version, "style/report.json")).catch(() => "unavailable");
+    const report = await this.styleReport;
+    if (this.version === version && this.activeTab === "Style") $(".style-report", content).textContent = report === "unavailable" ? "unavailable" : JSON.stringify(report, null, 2);
   }
 
   async showCritic() {

@@ -62,6 +62,16 @@ def worker_auth(request: Request) -> None:
         raise HTTPException(403, "Invalid Forge worker token.")
 
 
+@forge_router.post("/worker/catalog", dependencies=[Depends(worker_auth)])
+def publish_catalog(request: Request, body: dict[str, Any]):
+    return store(request).save_catalog(body)
+
+
+@forge_router.get("/catalog")
+def catalog(request: Request):
+    return store(request).get_catalog()
+
+
 class Payload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

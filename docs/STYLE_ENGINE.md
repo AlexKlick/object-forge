@@ -9,6 +9,18 @@ copy of repo B's `apps/greybox/assets/tools/style_compose.py`. Keep everything
 below its two-line source header byte-identical; the parity test skips explicitly
 when the spike checkout is absent.
 
+## Using it from the Forge UI
+
+The Forge board exposes styling for **Generate blockout from photos** and
+**From authored spec**. Select a spec from the worker catalog, add up to six
+style references, and configure seeds, strength, scales or a prompt override.
+Review each view's candidates with **Use this seed**, submit the review and
+approve the bake. The library marks styled versions and their **Style** subtab
+shows chosen images, metrics and the retained report. Palette-only mode hides
+styling and stages an empty review. See [From the UI and Catalog](BAKE_FORGE.md#from-the-ui)
+for the walkthrough and [worker catalog publication](FORGE_WORKER.md#catalog-publication)
+for the startup/bake refresh behavior.
+
 ## Model and GPU plan
 
 The approved stack is SD 1.5 (`stable-diffusion-v1-5/stable-diffusion-v1-5`, fp16

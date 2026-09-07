@@ -27,6 +27,44 @@ Compose resolves `../.runs/trellis2-container` relative to `deploy/`, so the hos
 path is **`<repo>/.runs/trellis2-container`**, not `<repo>/../.runs/trellis2-container`.
 The operator confirmed this existing directory; no bind-mount change is needed.
 
+## From the UI
+
+In Bake Forge, check **From authored spec**, choose a catalog asset and variant,
+and optionally change the destination Asset to an alias. Variant suggestions are
+not a restriction: an undeclared variant becomes an empty alias. Add up to six
+style references, leave **Enable styling** checked, and adjust seeds per view,
+strength or scales as needed. A prompt override is optional; supply one if the
+chosen variant has no prompt-pack entry. Photo **Generate** mode offers the same
+Style fieldset. Authored-spec jobs need no photo uploads.
+
+Create the job, then inspect the blockout and Style rows in review. **Use this
+seed** accepts that candidate and rejects the other style seeds for its view;
+the match review also lists compact **Style candidates** controls. Review the
+pass, drift, change, detail and PNG-check chips, then **Submit review**, wait for
+staging, and **Approve bake**. Open the finished version and its **Style** subtab
+for chosen images, metrics and the full retained report. Styled library cards
+carry a `styled` badge. Authored blockouts cannot regenerate in the job card;
+use **Edit blockout** from a version.
+
+For an unstyled palette bake, check **Palette only (no styling, zero-panel
+review)**. This hides styling and sends no style settings or references. The
+worker automatically stages the empty review; explicit bake approval is still
+required.
+
+## Catalog
+
+The host worker reads `specs/*.yaml` and `prompts/*.yaml` without modifying the
+spike tree and publishes a catalog at startup after the critic probe and after
+every successful bake. `GET /v1/forge/catalog` serves that stored snapshot to
+the UI; the API needs no spike mount. Bad YAML files are skipped and recorded
+in `errors` (diagnostics are capped at 200 characters). Publication failures are
+logged and never fail the worker or a completed bake. Once the catalog lists
+at least one spec, `from_spec` creation validates `spec_asset` against its assets
+and reports the known list on rejection. With no catalog or an empty spec list,
+creation remains permissive. Variants are not enforced. The empty picker says
+“No catalog published yet — start the host worker”; restart the worker to refresh
+a changed catalog before the next bake, then reopen the Forge tab.
+
 ## Environment
 
 | Process | Variable | Default / meaning |
