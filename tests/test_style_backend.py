@@ -46,7 +46,7 @@ class DiffusersBackendContractTests(unittest.TestCase):
         self.backend.load()
         self.backend.load()
         self.diffusers.ControlNetModel.from_pretrained.assert_called_once_with(
-            "depth", torch_dtype=self.torch.float16)
+            "depth", torch_dtype=self.torch.float16, variant="fp16")
         self.diffusers.StableDiffusionControlNetImg2ImgPipeline.from_pretrained.assert_called_once_with(
             "base", controlnet=self.diffusers.ControlNetModel.from_pretrained.return_value,
             torch_dtype=self.torch.float16, variant="fp16", safety_checker=None)

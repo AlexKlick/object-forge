@@ -53,7 +53,11 @@ class DiffusersBackend:
         import torch
         from diffusers import ControlNetModel, StableDiffusionControlNetImg2ImgPipeline
 
-        controlnet = ControlNetModel.from_pretrained(self.controlnet, torch_dtype=torch.float16)
+        # variant="fp16" on both: the shared cache holds only the fp16 weight
+        # files (pulled from the host — the container has no DNS), and without
+        # the variant diffusers looks for the full-precision file and fails.
+        controlnet = ControlNetModel.from_pretrained(self.controlnet, torch_dtype=torch.float16,
+                                                     variant="fp16")
         try:
             self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
                 self.base_model, controlnet=controlnet, torch_dtype=torch.float16,
