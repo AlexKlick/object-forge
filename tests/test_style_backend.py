@@ -54,8 +54,8 @@ class DiffusersBackendContractTests(unittest.TestCase):
             "adapter", subfolder="models", weight_name="ip-adapter_sd15.safetensors")
         self.pipe.enable_model_cpu_offload.assert_called_once_with(device="cuda:0")
         self.pipe.enable_attention_slicing.assert_called_once_with()
-        self.pipe.enable_vae_slicing.assert_called_once_with()
-        self.pipe.enable_vae_tiling.assert_called_once_with()
+        self.pipe.vae.enable_slicing.assert_called_once_with()
+        self.pipe.vae.enable_tiling.assert_called_once_with()
         self.pipe.set_progress_bar_config.assert_called_once_with(disable=True)
         self.assertTrue(self.backend.loaded)
 

@@ -67,8 +67,10 @@ class DiffusersBackend:
             self.pipe.enable_model_cpu_offload(device=self.device)
             self.pipe.enable_attention_slicing()
             # Bound VAE activation memory at the upper working resolution.
-            self.pipe.enable_vae_slicing()
-            self.pipe.enable_vae_tiling()
+            # diffusers 0.40 removed the pipeline-level enable_vae_slicing /
+            # enable_vae_tiling wrappers; the VAE exposes them directly.
+            self.pipe.vae.enable_slicing()
+            self.pipe.vae.enable_tiling()
             self.pipe.set_progress_bar_config(disable=True)
         except Exception:
             self.unload()
