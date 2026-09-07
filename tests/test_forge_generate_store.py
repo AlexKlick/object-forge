@@ -39,7 +39,7 @@ class GenerateStoreTests(unittest.TestCase):
         job = self.store.create_job('a', 'v', intent='generate', generate={'segment_refs': refs})
         refs.clear()
         self.assertEqual(job['generate'], {'segment_refs': [{'image_id': 'image1', 'segment_id': 'seg1'}] * 8,
-                         'height_hint': 12.0, 'floor_height': 3.0, 'blockout': None, 'regenerations': 0})
+                         'height_hint': 12.0, 'floor_height': 3.0, 'blockout': None, 'regenerations': 0, 'style': None})
         self.assertIsNone(job['parent_job'])
         self.assertNotIn('generate', self.store.create_job('a', 'v'))
 
@@ -143,6 +143,49 @@ class IterateBlockoutStoreTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = ForgeStore(Path(self.tmp.name) / 'store')
+
+    def test_from_spec_defaults_parent_matrix_and_regeneration(self):
+        job = self.store.create_job('a', 'v', intent='from_spec')
+        self.assertEqual(job['uploads'], [])
+        self.assertEqual(job['generate'], {'spec_asset': 'a', 'palette_only': False,
+            'style': None, 'blockout': None, 'regenerations': 0, 'segment_refs': []})
+        for fields in ({'parent_job': job['id']}, {'parent_version': 1}, {'replacement_views': ['front']}):
+            with self.subTest(fields=fields), self.assertRaises(ForgeStoreError):
+                self.store.create_job('a', 'v', intent='from_spec', **fields)
+        for settings in ({'spec_asset': '../escape'}, {'palette_only': 1}, {'unknown': True},
+                         {'palette_only': True, 'style': {'enabled': True}}):
+            with self.subTest(settings=settings), self.assertRaises(ForgeStoreError):
+                self.store.create_job('a', 'v', intent='from_spec', generate=settings)
+        with self.assertRaisesRegex(ForgeConflict, 'Authored specs are not regenerated; edit the blockout instead'):
+            self.store.regenerate_blockout(job['id'], {})
+        job['state'] = 'baking'
+        self.store._save_job(job)
+        version = self.store.create_version(job['id'], artifacts={'blockout/spec.yaml': b'asset: a\n'})
+        for intent in ('iterate_blockout', 'iterate_params', 'iterate_views'):
+            child = self.store.create_job('a', 'v', intent=intent, parent_job=job['id'], parent_version=version['number'],
+                                         generate={'edit': {'height': 18}} if intent == 'iterate_blockout' else None)
+            self.assertEqual(child['parent_job'], job['id'])
+
+    def test_style_bounds_types_and_palette_only(self):
+        limits = {'seeds_per_view': (1, 6), 'strength': (0.2, 0.95), 'guidance': (1, 15),
+                  'control_scale': (0, 1.5), 'ip_scale': (0, 1.5), 'steps': (8, 50),
+                  'long_side': (512, 1024), 'seed_base': (0, 100000)}
+        for key, (lo, hi) in limits.items():
+            for value in (lo, hi):
+                self.assertEqual(self.store.validate_style({key: value})[key], value)
+            for value in (lo - 1, True, '1', float('nan'), float('inf')):
+                with self.subTest(key=key, value=value), self.assertRaises(ForgeStoreError):
+                    self.store.validate_style({key: value})
+            if key != 'seed_base':
+                with self.assertRaises(ForgeStoreError):
+                    self.store.validate_style({key: hi + 1})
+        for style in ([], {'enabled': 1}, {'long_side': 513}, {'steps': 8.5},
+                      {'prompt_override': 'x' * 401}, {'negative_override': 0}, {'extra': 1}):
+            with self.subTest(style=style), self.assertRaises(ForgeStoreError):
+                self.store.validate_style(style)
+        job = self.store.create_job('a', 'v', intent='from_spec', generate={
+            'palette_only': True, 'style': {'enabled': False, 'prompt_override': 'x' * 400}})
+        self.assertFalse(job['generate']['style']['enabled'])
 
     def parent(self, intent='generate', artifacts=None):
         job = self.store.create_job('a', 'v', intent=intent, canonical_views=['old'])

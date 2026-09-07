@@ -54,18 +54,24 @@ a.report.write_text(json.dumps({'confidence': {'height': 'low'}, 'assumptions': 
                                 'next_view': 'roof', 'params': {'floor_height': a.floor_height}}))
 '''
 BLOCKOUT = r'''
-import sys, yaml
+import sys, yaml, json
 from pathlib import Path
 from PIL import Image, ImageDraw
 spec, root = yaml.safe_load(Path(sys.argv[1]).read_text()), Path(sys.argv[2])
+variant = sys.argv[3] if len(sys.argv) > 3 else 'default'
 for index, view in enumerate(spec['views']):
     image = Image.new('RGBA', (128, 128), 'white')
     draw = ImageDraw.Draw(image)
     if index == 0: draw.polygon([(24, 108), (64, 20), (104, 108)], fill='#778899')
     else: draw.rectangle((20, 20, 30 + index * 15, 100), fill='#778899')
-    out = root / 'renders' / spec['asset'] / 'default'
+    out = root / 'renders' / spec['asset'] / variant
     out.mkdir(parents=True, exist_ok=True)
     image.save(out / (view + '.png'))
+    (out / 'passes').mkdir(exist_ok=True)
+    Image.new('I;16', image.size, 32000).save(out / 'passes' / (view + '.depth.png'))
+plan = root / 'blockouts' / spec['asset'] / variant / 'build_plan.json'
+plan.parent.mkdir(parents=True, exist_ok=True)
+plan.write_text(json.dumps({'palette': spec['palette'], 'bbox': {'min': [-4, -3, 0], 'max': [4, 3, 12]}}))
 '''
 
 
@@ -76,9 +82,25 @@ class GenerateWorkerTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.assets = self.root / 'spike'
         (self.assets / 'tools').mkdir(parents=True)
-        for name in ('sheet_match.py', 'spec_synth.py', 'blockout.py', 'view_validate.py', 'atlas_layout.py'):
+        for name in ('sheet_match.py', 'spec_synth.py', 'blockout.py', 'view_validate.py', 'atlas_layout.py',
+                     'style_prompt.py', 'style_metrics.py', 'style_compose.py', 'style_check.py'):
             (self.assets / 'tools' / name).write_bytes((DEFAULT_SPIKE_ASSETS / 'tools' / name).read_bytes())
         (self.assets / 'tools/bake_views.py').write_text('SELFCHECK_THRESHOLD = 0.9\n')
+        (self.assets / 'specs').mkdir()
+        (self.assets / 'prompts').mkdir()
+        spec = {'asset': 'a', 'palette': {'body': {'hex': '778899', 'roughness': 0.8}},
+                'massing': {'footprint': {'width': 8, 'depth': 6},
+                            'plinth': {'floors': 4, 'floor_height': 3, 'material': 'body'}},
+                'attachments': {}, 'png_spec': {'size': 2048},
+                'variants': {'default': {}, 'v': {'palette': {'body': {'hex': '8899aa'}},
+                                                'massing': {'plinth': {'floors': 8, 'floor_height': 1.5}}}},
+                'views': {v: {'azimuth': i * 45, 'elevation': 20} for i, v in enumerate(['front', 'back', *VIEWS])}}
+        (self.assets / 'specs/a.yaml').write_text(yaml.safe_dump(spec))
+        (self.assets / 'prompts/a.yaml').write_text(yaml.safe_dump({'short': {'v': 'Painted stone workshop'}}))
+        prop = {**spec, 'asset': 'prop', 'massing': {'footprint': {'width': 8, 'depth': 6}},
+                'attachments': {'social': [{'id': 'body', 'kind': 'box', 'size': [8, 6, 12],
+                                             'pos': [0, 0, 6], 'material': 'body'}]}}
+        (self.assets / 'specs/prop.yaml').write_text(yaml.safe_dump(prop))
         self.before = self.snapshot()
         self.addCleanup(lambda: self.assertEqual(self.snapshot(), self.before, 'SPIKE TREE CHANGED'))
         app = FastAPI(); app.state.forge_store = ForgeStore(self.root / 'store'); app.include_router(forge_router)
@@ -97,7 +119,7 @@ class GenerateWorkerTests(unittest.TestCase):
             'FORGE_WORKER_TOKEN': 'test-bake', 'FORGE_BAKE_PYTHON': sys.executable,
             'FORGE_STORE_ROOT': str(self.store.root),
             'FORGE_SYNTH_CMD': f'{shlex.quote(sys.executable)} {shlex.quote(str(synth))} {{inputs}} --asset {{asset}} --out {{out}} --height-hint {{height_hint}} --floor-height {{floor_height}} --report {{report}}',
-            'FORGE_BLOCKOUT_CMD': f'{shlex.quote(sys.executable)} {shlex.quote(str(render))} {{spec}} {{out}}',
+            'FORGE_BLOCKOUT_CMD': f'{shlex.quote(sys.executable)} {shlex.quote(str(render))} {{spec}} {{out}} {{variant}}',
             'FORGE_BAKE_CMD': f'{shlex.quote(sys.executable)} {shlex.quote(str(bake))} {{assets_root}} ok {{spec}}',
         })
         self.env.start(); self.addCleanup(self.env.stop)

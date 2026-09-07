@@ -45,6 +45,61 @@ class ForgeApiTests(unittest.TestCase):
         return create_app(config_path=ROOT / "configs/app.example.yaml", ui_root=ui,
                           segmenter=ColorFloodSegmenter(), allow_real_generation=False)
 
+    def test_from_spec_style_refs_routes_auth_lease_and_validation(self):
+        fields = {'asset': 'a', 'variant': 'v', 'intent': 'from_spec',
+                  'style': '{"enabled": true}', 'canonical_views': '["front"]'}
+        refs = [('style_refs[]', ('ref.png', png_bytes(), 'image/png'))] * 6
+        response = self.client.post('/v1/forge/jobs', data=fields, files=refs)
+        self.assertEqual(response.status_code, 201, response.text)
+        job = response.json()
+        self.assertEqual(len(job['style_refs']), 6)
+        base = f"/v1/forge/jobs/{job['id']}"
+        response = self.client.get(base + '/style/refs/0')
+        self.assertEqual(response.content, png_bytes())
+        self.assertEqual(response.headers['content-type'], 'image/png')
+        self.assertEqual(self.client.get(base + '/style/refs/6').status_code, 404)
+        self.assertEqual(self.client.post(base + '/blockout/regenerate', json={}).status_code, 409)
+        job = self.store.claim_job(stages=['matching'], job_id=job['id'])
+        lease = job['lease']['lease_id']
+        route = base + '/style/front/1000.png'
+        with patch.dict(os.environ, {'FORGE_WORKER_TOKEN': 'secret'}):
+            self.assertEqual(self.client.post(route, content=png_bytes()).status_code, 403)
+            headers = {'X-Forge-Worker': 'secret', 'X-Forge-Lease': 'stale'}
+            self.assertEqual(self.client.post(route, content=png_bytes(), headers=headers).status_code, 409)
+            headers['X-Forge-Lease'] = lease
+            self.assertEqual(self.client.post(route, content=png_bytes(), headers=headers).status_code, 200)
+            for path in ('/style/front/-1.png', '/style/unknown/1.png'):
+                self.assertEqual(self.client.post(base + path, content=png_bytes(), headers=headers).status_code, 422)
+            self.assertEqual(self.client.post(route, content=b'', headers=headers).status_code, 422)
+            self.assertEqual(self.client.post(route, content=b'x' * (24 * 1024 * 1024 + 1), headers=headers).status_code, 422)
+            report = {'views': {'front': {'seeds': [1000], 'chosen': 1000,
+                       'metrics': {'1000': {'metrics': {'pass': True}, 'checks': {'pass': True}}}}},
+                      'prompt_tokens': {'front': 30}, 'model': 'fake', 'refs': 6,
+                      'params': job['generate']['style']}
+            body = {'report': report, 'lease_id': lease}
+            self.assertEqual(self.client.post(base + '/style', json=body).status_code, 403)
+            self.assertEqual(self.client.post(base + '/style', json={**body, 'lease_id': 'stale'}, headers=headers).status_code, 409)
+            self.assertEqual(self.client.post(base + '/style', json=body, headers=headers).status_code, 200)
+            self.assertEqual(self.client.get(base + '/style').json(), report)
+            self.assertEqual(self.client.get(route).content, png_bytes())
+            invalid = {**report, 'views': {'front': {**report['views']['front'], 'chosen': 55}}}
+            self.assertEqual(self.client.post(base + '/style', json={**body, 'report': invalid}, headers=headers).status_code, 422)
+            self.store.worker_match(job['id'], {'panels': []}, lease)
+            self.assertEqual(self.client.post(route, content=png_bytes(), headers=headers).status_code, 409)
+            self.assertEqual(self.client.post(base + '/style', json=body, headers=headers).status_code, 409)
+        before = len(self.store.list_jobs())
+        for updates, files in (({}, refs + refs[:1]), ({'style': '{'}, []),
+                               ({'style': '{"steps": 1}'}, []), ({'palette_only': 'true'}, []),
+                               ({'spec_asset': '../x'}, []), ({'palette_only': 'perhaps'}, []),
+                               ({}, [('style_refs', ('bad.png', b'bad', 'image/png'))])):
+            with self.subTest(updates=updates):
+                response = self.client.post('/v1/forge/jobs', data=fields | updates, files=files)
+                self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(len(self.store.list_jobs()), before)
+        with patch.object(self.store, 'record_style_ref', side_effect=ValueError('write refused')):
+            self.assertEqual(self.client.post('/v1/forge/jobs', data=fields, files=refs[:1]).status_code, 422)
+        self.assertEqual(len(self.store.list_jobs()), before)
+
     def upload(self, **fields):
         response = self.client.post("/v1/forge/jobs", data={
             "asset": "chair", "variant": "oak", "params": "{}",

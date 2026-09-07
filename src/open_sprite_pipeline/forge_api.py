@@ -139,11 +139,14 @@ def assets(request: Request):
 
 @forge_router.post("/jobs", status_code=201)
 async def create_job(request: Request):
-    async with request.form(max_files=8, max_fields=16) as form:
+    async with request.form(max_files=16, max_fields=16) as form:
         files = form.getlist("files") + form.getlist("files[]")
-        minimum = 0 if form.get("intent") in {"iterate_params", "generate", "iterate_blockout"} else 1
+        minimum = 0 if form.get("intent") in {"iterate_params", "generate", "from_spec", "iterate_blockout"} else 1
         if not minimum <= len(files) <= 8 or not all(isinstance(f, UploadFile) for f in files):
             raise HTTPException(422, "Upload between one and eight images.")
+        style_refs = form.getlist("style_refs") + form.getlist("style_refs[]")
+        if len(style_refs) > 6 or not all(isinstance(f, UploadFile) for f in style_refs):
+            raise ForgeStoreError("Upload at most six style references.")
         params = json.loads(form.get("params", "{}"))
         if not isinstance(params, dict):
             raise ForgeStoreError("Params must be a JSON object.")
@@ -154,7 +157,7 @@ async def create_job(request: Request):
         replacements = json.loads(form.get("replacement_views", "[]"))
         parent_version = form.get("parent_version")
         prepared = []
-        for upload in files:
+        for upload in files + style_refs:
             data = await upload.read(20 * 1024 * 1024 + 1)
             if not data or len(data) > 20 * 1024 * 1024:
                 raise ForgeStoreError("Each image must be nonempty and at most 20 MiB.")
@@ -169,7 +172,22 @@ async def create_job(request: Request):
             if media_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
                 raise ForgeStoreError("Unsupported image format.")
             prepared.append((upload.filename or "image", media_type, data))
+        prepared, prepared_refs = prepared[:len(files)], prepared[len(files):]
         generate = None
+        intent = form.get("intent", "fresh")
+        if "style" in form and intent not in {"generate", "from_spec"}:
+            raise ForgeStoreError("Style settings require generate or from_spec intent.")
+        if any(key in form for key in ("spec_asset", "palette_only")) and intent != "from_spec":
+            raise ForgeStoreError("Authored spec fields require from_spec intent.")
+        if style_refs and intent not in {"generate", "from_spec"}:
+            raise ForgeStoreError("Style references require generate or from_spec intent.")
+        if intent == "from_spec":
+            palette_only = form.get("palette_only", "false").lower()
+            if palette_only not in {"0", "false", "1", "true"}:
+                raise ForgeStoreError("palette_only must be true or false.")
+            generate = {"spec_asset": form.get("spec_asset", form.get("asset", "")),
+                        "palette_only": palette_only in {"1", "true"},
+                        "style": json.loads(form.get("style", "null"))}
         if "edit" in form and form.get("intent") != "iterate_blockout":
             raise ForgeStoreError("Edit requires iterate_blockout intent.")
         if form.get("intent") == "iterate_blockout":
@@ -181,6 +199,7 @@ async def create_job(request: Request):
                 "segment_refs": json.loads(form.get("segment_refs", "[]")),
                 "height_hint": float(form.get("height_hint", "12")),
                 "floor_height": float(form.get("floor_height", "3")),
+                "style": json.loads(form.get("style", "null")),
             })
             count = len(files) + len(generate["segment_refs"])
             if not 1 <= count <= 7:
@@ -200,6 +219,8 @@ async def create_job(request: Request):
             try:
                 for filename, media_type, data in prepared:
                     target.record_upload(job["id"], filename, media_type, data)
+                for filename, media_type, data in prepared_refs:
+                    target.record_style_ref(job["id"], filename, media_type, data)
             except Exception:
                 target.delete_job(job["id"])
                 raise
@@ -307,16 +328,44 @@ def match_report(request: Request, job_id: str, body: MatchReport):
     return store(request).worker_match(job_id, body.report, body.lease_id)
 
 
-async def worker_image(request: Request) -> tuple[bytes, str]:
+async def worker_image(request: Request, max_mib: int = 20) -> tuple[bytes, str]:
     # Host worker owns image processing; this endpoint only stores opaque bytes.
     payload = bytearray()
     async for chunk in request.stream():
         payload.extend(chunk)
-        if len(payload) > 20 * 1024 * 1024:
-            raise ForgeStoreError("Worker images are limited to 20 MiB.")
+        if len(payload) > max_mib * 1024 * 1024:
+            raise ForgeStoreError(f"Worker images are limited to {max_mib} MiB.")
     if not payload:
         raise ForgeStoreError("Worker image must be nonempty.")
     return bytes(payload), request.headers.get("X-Forge-Lease", "")
+
+
+@forge_router.get("/jobs/{job_id}/style/refs/{n}")
+def style_ref(request: Request, job_id: str, n: int):
+    path, media_type = store(request).style_ref_file(job_id, n)
+    return FileResponse(path, media_type=media_type)
+
+
+@forge_router.post("/jobs/{job_id}/style/{view}/{seed}.png", dependencies=[Depends(worker_auth)])
+async def style_candidate(request: Request, job_id: str, view: str, seed: int):
+    payload, lease = await worker_image(request, max_mib=24)
+    store(request).worker_style_candidate(job_id, view, seed, payload, lease)
+    return {"view": view, "seed": seed}
+
+
+@forge_router.get("/jobs/{job_id}/style/{view}/{seed}.png")
+def read_style_candidate(request: Request, job_id: str, view: str, seed: int):
+    return FileResponse(store(request).style_candidate_file(job_id, view, seed), media_type="image/png")
+
+
+@forge_router.post("/jobs/{job_id}/style", dependencies=[Depends(worker_auth)])
+def style_report(request: Request, job_id: str, body: MatchReport):
+    return store(request).worker_style_report(job_id, body.report, body.lease_id)
+
+
+@forge_router.get("/jobs/{job_id}/style")
+def read_style_report(request: Request, job_id: str):
+    return store(request).get_style_report(job_id)
 
 
 @forge_router.post("/jobs/{job_id}/panels/{panel_id}", dependencies=[Depends(worker_auth)])

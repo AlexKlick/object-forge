@@ -11,6 +11,7 @@ Environment=FORGE_API=http://127.0.0.1:8050
 Environment=FORGE_STORE_ROOT=/home/alexk/documents/open_sprite_pipeline/open_sprite_pipeline/.runs/trellis2-container/ui/forge
 Environment=FORGE_SPIKE_ASSETS=/home/alexk/debt-city-greybox-spike/apps/greybox/assets
 Environment=FORGE_BAKE_PYTHON=/home/alexk/.venv/bin/python
+Environment=FORGE_STYLE_URL=http://127.0.0.1:8056
 Environment=FORGE_CRITIC_URL=http://127.0.0.1:18001/v1
 Environment=FORGE_CRITIC_MODEL=Qwen/Qwen3.5-4B
 Environment=FORGE_CRITIC_ENABLED=1

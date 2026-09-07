@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from collections import Counter
+from functools import partial
 import base64
 import fcntl
 import hashlib
@@ -32,6 +33,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 import yaml
 
 from . import forge_glb
+from .style_client import StyleClient, StyleBusy, StyleError
 
 DEFAULT_SPIKE_ASSETS = Path("/home/alexk/debt-city-greybox-spike/apps/greybox/assets")
 BAKE_MARKERS = re.compile(r"\b(?:PROJECT|SELFCHECK|VIEW-VALIDATE|TURNTABLE|BAKE|VERIFY)\b")
@@ -100,25 +102,31 @@ class ForgeClient:
             return json.loads(payload) if "application/json" in response.headers.get("Content-Type", "") else payload
 
 
-def load_matcher(assets: Path):
+def load_tool(assets: Path, name: str):
+    if name not in {"sheet_match", "blockout", "style_prompt", "style_metrics", "style_check", "style_compose"}:
+        raise ValueError("Unsupported spike helper.")
     # Keep disabled for the host process lifetime, including lazy helper imports.
     sys.dont_write_bytecode = True
     directory = str(assets.resolve() / "tools")
     sys.path.insert(0, directory)
     try:
         # An embedding caller may previously have loaded a different spike tree.
-        previous = sys.modules.pop("sheet_match", None)
+        previous = sys.modules.pop(name, None)
         try:
-            module = importlib.import_module("sheet_match")
-            if Path(module.__file__).resolve() != (Path(directory) / "sheet_match.py").resolve():
-                raise ValueError("sheet_match must come from FORGE_SPIKE_ASSETS/tools.")
+            module = importlib.import_module(name)
+            if Path(module.__file__).resolve() != (Path(directory) / f"{name}.py").resolve():
+                raise ValueError(f"{name} must come from FORGE_SPIKE_ASSETS/tools.")
             return module
         finally:
-            sys.modules.pop("sheet_match", None)
+            sys.modules.pop(name, None)
             if previous is not None:
-                sys.modules["sheet_match"] = previous
+                sys.modules[name] = previous
     finally:
         sys.path.remove(directory)
+
+
+def load_matcher(assets: Path):
+    return load_tool(assets, "sheet_match")
 
 
 def png(image) -> bytes:
@@ -128,10 +136,17 @@ def png(image) -> bytes:
 
 
 class ForgeWorker:
-    def __init__(self, client: ForgeClient, assets: Path):
+    def __init__(self, client: ForgeClient, assets: Path, *, style=None):
         self.client = client
         self.assets = assets.resolve()
         self._matcher = None
+        self._tools = {}
+        self.style = style
+        if self.style is None and os.getenv("FORGE_STYLE_URL"):
+            self.style = StyleClient(os.environ["FORGE_STYLE_URL"], float(os.getenv("FORGE_STYLE_TIMEOUT_S", "600")))
+        self.style_wait_s = float(os.getenv("FORGE_STYLE_WAIT_S", "900"))
+        if not math.isfinite(self.style_wait_s) or self.style_wait_s < 0:
+            raise ValueError("FORGE_STYLE_WAIT_S must be finite and nonnegative.")
         self.critic = None
         override = os.getenv("FORGE_STORE_ROOT")
         self._store_override = None
@@ -147,6 +162,35 @@ class ForgeWorker:
         if self._matcher is None:
             self._matcher = load_matcher(self.assets)
         return self._matcher
+
+    def tool(self, name):
+        if name not in self._tools:
+            module = load_tool(self.assets, name)
+            if name == "style_metrics":
+                # evaluate has no scale option. This private module instance uses
+                # half-size blur/erosion to preserve the full-frame spatial scale.
+                # Full-frame float Lab blurs cost seconds per candidate at 2048².
+                module.palette_drift = partial(module.palette_drift, blur=8.0)
+                module.detail_gain = partial(module.detail_gain, blur=2.0, erode=4)
+                module.change = partial(module.change, blur=0.0, erode=4)
+            self._tools[name] = module
+        return self._tools[name]
+
+    @property
+    def style_prompt(self):
+        return self.tool("style_prompt")
+
+    @property
+    def style_metrics(self):
+        return self.tool("style_metrics")
+
+    @property
+    def style_check(self):
+        return self.tool("style_check")
+
+    @property
+    def style_compose(self):
+        return self.tool("style_compose")
 
     def store_root(self) -> Path:
         if self._store_override is not None:
@@ -216,7 +260,8 @@ class ForgeWorker:
 
     @staticmethod
     def generate_family(job: dict) -> bool:
-        return job.get("intent") in {"generate", "iterate_blockout"}
+        return (job.get("intent") in {"generate", "from_spec", "iterate_blockout"}
+                or bool(job.get("inputs", {}).get("workspace_parent")))
 
     def workspace_root(self, job: dict) -> Path:
         root = self.store_root()
@@ -225,7 +270,7 @@ class ForgeWorker:
                 raise ValueError("Invalid workspace identifier.")
         ws = checked_path(root, f"assets/{job['asset']}/workspace/{job['variant']}")
         pair = f"{job['asset']}/{job['variant']}"
-        for directory in ("in", "specs", f"blockouts/{pair}", f"renders/{pair}",
+        for directory in ("in", "specs", "prompts", "style", f"blockouts/{pair}", f"renders/{pair}",
                           f"styled/{pair}/views", f"bakes/{pair}"):
             checked_path(root, ws.relative_to(root) / directory).mkdir(parents=True, exist_ok=True)
         return ws
@@ -368,7 +413,7 @@ class ForgeWorker:
                 "--asset", job["asset"], "--out", str(out), "--height-hint", str(settings["height_hint"]),
                 "--floor-height", str(settings["floor_height"]), "--report", str(report)]
 
-    def sources(self, job: dict):
+    def sources(self, job: dict, *, include_style=True):
         base = f"/jobs/{job['id']}"
         for index in job.get("inputs", {}).get("parent_uploads", []):
             yield f"p{index}", f"/jobs/{job['parent_job']}/uploads/{index}", {"parent_upload_index": index}
@@ -377,13 +422,49 @@ class ForgeWorker:
         for index, _ in enumerate(job.get("generate", {}).get("segment_refs", [])):
             yield f"c{index}", f"{base}/cutouts/{index}.png", {"cutout_index": index}
 
+        if include_style:
+            for view, entry in (job.get("style") or {}).get("views", {}).items():
+                for seed in entry["seeds"]:
+                    yield f"s{view}-{seed}", f"{base}/style/{view}/{seed}.png", {"style_view": view, "seed": seed}
+
     def process_generate(self, job: dict) -> dict:
         ws = self.workspace_root(job)
         base = f"/jobs/{job['id']}"
         settings = job["generate"]
         spec_path = checked_path(ws, f"specs/{job['asset']}.yaml")
         report_path = checked_path(ws, "synth_report.json")
-        if job["intent"] == "iterate_blockout":
+        if job.get("inputs", {}).get("workspace_parent"):
+            lease = job["lease"]["lease_id"]
+            spec_path.write_bytes(self.client.request("GET",
+                f"/assets/{job['asset']}/variants/{job['variant']}/versions/{job['parent_version']}/artifacts/blockout/spec.yaml"))
+            directory = checked_path(ws, f"renders/{job['asset']}/{job['variant']}")
+            for path in directory.glob("*.png"):
+                checked_path(ws, path.relative_to(ws)).unlink()
+            self.client.request("PATCH", base, {"canonical_views": job["canonical_views"], "lease_id": lease})
+            for view in job["canonical_views"]:
+                data = self.client.request("GET", f"/jobs/{job['parent_job']}/renders/{view}.png")
+                checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(data)
+                self.client.request("POST", base + f"/renders/{view}.png", data, lease=lease)
+            self.client.request("POST", base + "/blockout", {
+                "blockout": settings["blockout"], "lease_id": lease,
+                "artifact": {"encoding": "base64", "data": base64.b64encode(spec_path.read_bytes()).decode("ascii")}})
+            return self.render_masks(job, ws / "renders")
+        authored = job["intent"] == "from_spec"
+        if (settings.get("style") or {}).get("enabled") and self.style is None:
+            raise ValueError("Styling engine not configured (FORGE_STYLE_URL)")
+        pack_path = checked_path(ws, f"prompts/{job['asset']}.yaml")
+        pack_path.unlink(missing_ok=True)
+        if authored:
+            source = checked_path(self.assets, f"specs/{settings['spec_asset']}.yaml")
+            spec = yaml.safe_load(source.read_bytes())
+            spec["asset"] = job["asset"]
+            spec_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+            pack = checked_path(self.assets, f"prompts/{settings['spec_asset']}.yaml")
+            if pack.is_file():
+                pack_path.write_bytes(pack.read_bytes())
+            report = {"source": "spec", "spec_asset": settings["spec_asset"],
+                      "confidence": {}, "assumptions": ["Authored spec; no inference."], "next_view": ""}
+        elif job["intent"] == "iterate_blockout":
             parent_spec = checked_path(ws, f"specs/{job['asset']}.parent.yaml")
             parent_spec.write_bytes(self.client.request("GET",
                 f"/assets/{job['asset']}/variants/{job['variant']}/versions/{job['parent_version']}/artifacts/blockout/spec.yaml"))
@@ -397,7 +478,7 @@ class ForgeWorker:
             report["next_view"] = report.get("next_view") or ""
         else:
             inputs = []
-            for name, route, metadata in self.sources(job):
+            for name, route, metadata in self.sources(job, include_style=False):
                 data = self.client.request("GET", route)
                 image = self.matcher.load_image(BytesIO(data))
                 if "upload_index" in metadata:
@@ -434,53 +515,171 @@ class ForgeWorker:
             report["edit"] = json.loads(edit_report.read_bytes())
             report["assumptions"].append("Operator overrides applied after photo synthesis; confidence describes photo inference.")
         spec = yaml.safe_load(spec_path.read_bytes())
-        if spec["asset"] != job["asset"] or len(spec["views"]) != 5:
+        if spec["asset"] != job["asset"] or (job["intent"] == "generate" and len(spec["views"]) != 5):
             raise ValueError("Generated spec must identify this asset and five canonical views.")
         views = sorted(spec["views"])
         if any(not re.fullmatch(r"[A-Za-z0-9_]+", view) for view in views):
             raise ValueError("Unsafe canonical view name.")
         # spec_synth owns the default geometry; an empty alias supports the UI's
         # named variant without changing massing or the companion source tree.
-        spec["variants"][job["variant"]] = {}
+        spec["variants"].setdefault(job["variant"], {})
         spec_path.write_text(yaml.safe_dump(spec, sort_keys=False))
         report_path.write_text(json.dumps(report, allow_nan=False, indent=2))
-        default_renders = checked_path(ws, f"renders/{job['asset']}/default")
+        render_variant = job["variant"] if authored or job["intent"] == "iterate_blockout" else "default"
+        default_renders = checked_path(ws, f"renders/{job['asset']}/{render_variant}")
         default_renders.mkdir(parents=True, exist_ok=True)
-        for path in default_renders.glob("*.png"):
+        for path in default_renders.rglob("*.png"):
             checked_path(ws, path.relative_to(ws)).unlink()
+        checked_path(ws, f"blockouts/{job['asset']}/{render_variant}/build_plan.json").unlink(missing_ok=True)
+        if render_variant != job["variant"]:
+            checked_path(ws, f"blockouts/{job['asset']}/{job['variant']}/build_plan.json").unlink(missing_ok=True)
         override = os.getenv("FORGE_BLOCKOUT_CMD")
-        command = (self.command_override(override, {"spec": spec_path, "out": ws}) if override else
+        command = (self.command_override(override, {"spec": spec_path, "out": ws, "variant": render_variant}) if override else
                    [os.getenv("FORGE_BAKE_PYTHON", "/home/alexk/.venv/bin/python"),
                     str(checked_path(self.assets, "tools/blockout.py")), "--spec", str(spec_path),
-                    "--variant", "default", "--out", str(ws), "--views", "all"])
+                    "--variant", render_variant, "--out", str(ws), "--views", "all"])
         self.run_workspace_command(job, command, "blockout")
-        renders = {}
-        for view in views:
-            renders[view] = checked_path(ws, f"renders/{job['asset']}/default/{view}.png").read_bytes()
+        renders = {view: checked_path(ws, default_renders.relative_to(ws) / f"{view}.png").read_bytes()
+                   for view in views}
         directory = checked_path(ws, f"renders/{job['asset']}/{job['variant']}")
-        for path in directory.glob("*.png"):
-            checked_path(ws, path.relative_to(ws)).unlink()
-        for view, data in renders.items():
-            checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(data)
+        if directory != default_renders:
+            for path in directory.rglob("*.png"):
+                checked_path(ws, path.relative_to(ws)).unlink()
+            for view, data in renders.items():
+                checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(data)
+            for path in default_renders.glob("passes/*.depth.png"):
+                target = checked_path(ws, directory.relative_to(ws) / "passes" / path.name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(checked_path(ws, path.relative_to(ws)).read_bytes())
+            plan = checked_path(ws, f"blockouts/{job['asset']}/{render_variant}/build_plan.json")
+            if plan.is_file():
+                checked_path(ws, f"blockouts/{job['asset']}/{job['variant']}/build_plan.json").write_bytes(plan.read_bytes())
         lease = job["lease"]["lease_id"]
         self.client.request("PATCH", base, {"canonical_views": views, "lease_id": lease})
         for view, data in renders.items():
             self.client.request("POST", base + f"/renders/{view}.png", data, lease=lease)
-        massing = spec["massing"]
+        resolved = (self.tool("blockout").apply_variant(spec, spec["variants"][job["variant"]] or {})
+                    if authored or job["intent"] == "iterate_blockout" else spec)
+        massing = resolved.get("massing", {})
         tower = massing.get("tower")
         if tower and not tower.get("enabled", False):
             tower = None
-        plinth = massing["plinth"]
-        payload = {"params": {"footprint": massing["footprint"],
-                    "height": plinth["floors"] * plinth["floor_height"] + (tower["floors"] * tower["floor_height"] if tower else 0),
-                    "plinth": {key: plinth[key] for key in ("floors", "floor_height")},
+        plinth = massing.get("plinth")
+        payload = {"params": {"footprint": massing.get("footprint", {}),
+                    "height": (plinth["floors"] * plinth["floor_height"] if plinth else 0) + (tower["floors"] * tower["floor_height"] if tower else 0),
+                    "plinth": {key: plinth[key] for key in ("floors", "floor_height")} if plinth else None,
                     "tower": {key: tower[key] for key in ("width", "floors", "location")} if tower else None},
-                   "palette": {role: {"hex": color["hex"]} for role, color in spec["palette"].items()},
+                   "palette": {role: {"hex": color["hex"]} for role, color in resolved["palette"].items()},
                    "confidence": report["confidence"], "assumptions": report["assumptions"],
                    "next_view": report["next_view"], "synth_report": report, "views": views}
+        if authored:
+            plan = json.loads(checked_path(ws, f"blockouts/{job['asset']}/{job['variant']}/build_plan.json").read_bytes())
+            lo, hi = plan["bbox"]["min"], plan["bbox"]["max"]
+            payload["params"].update(footprint={"width": hi[0] - lo[0], "depth": hi[1] - lo[1]}, height=hi[2] - lo[2])
+            payload["palette"] = plan["palette"]
         self.client.request("POST", base + "/blockout", {"blockout": payload, "lease_id": lease,
             "artifact": {"encoding": "base64", "data": base64.b64encode(spec_path.read_bytes()).decode("ascii")}})
+        if job["intent"] in {"generate", "from_spec"} and (settings.get("style") or {}).get("enabled"):
+            self.style_views(job, ws, views)
         return self.render_masks(job, ws / "renders")
+
+    def style_views(self, job: dict, ws: Path, views: list[str]) -> dict:
+        from PIL import Image
+
+        if self.style is None:
+            raise ValueError("Styling engine not configured (FORGE_STYLE_URL)")
+        settings = job["generate"]["style"]
+        asset, variant = job["asset"], job["variant"]
+        base, lease = f"/jobs/{job['id']}", job["lease"]["lease_id"]
+        pack_path = checked_path(ws, f"prompts/{asset}.yaml")
+        pack = yaml.safe_load(pack_path.read_bytes()) if pack_path.is_file() else {
+            "descriptions": {variant: f"{asset} {variant} building"}}
+        if settings["prompt_override"] is not None:
+            pack = {"short": {variant: settings["prompt_override"]}}
+        if variant not in (pack.get("short") or {}) and variant not in (pack.get("descriptions") or {}):
+            # An undeclared variant alias has no authored prompt; a bare KeyError
+            # from build_prompt would not tell the operator what to supply.
+            raise ValueError(f"No prompt for variant {variant!r} in prompts/{asset}.yaml; "
+                             "set style.prompt_override or add a short/descriptions entry")
+        palette = json.loads(checked_path(ws, f"blockouts/{asset}/{variant}/build_plan.json").read_bytes())["palette"]
+        refs = []
+        for ref in job.get("style_refs", []):
+            data = self.client.request("GET", base + f"/style/refs/{ref['index']}")
+            # Uploads accept JPEG/WebP/GIF as well; the sidecar accepts PNG only.
+            with Image.open(BytesIO(data)) as image:
+                refs.append(base64.b64encode(png(image.convert("RGB"))).decode("ascii"))
+        report = {"views": {}, "prompt_tokens": {}, "model": "", "refs": len(refs), "params": settings}
+        result = {"chosen": {}}
+        for view_index, view in enumerate(views):
+            init_path = checked_path(ws, f"renders/{asset}/{variant}/{view}.png")
+            depth_path = checked_path(ws, f"renders/{asset}/{variant}/passes/{view}.depth.png")
+            if not depth_path.is_file():
+                raise ValueError(f"No depth pass for {view}; regenerate the blockout with the current tools")
+            prompt = self.style_prompt.build_prompt(pack, variant, view, palette)
+            seeds = [settings["seed_base"] + 100 * i + view_index for i in range(settings["seeds_per_view"])]
+            request = {"view": view, "init_png": base64.b64encode(init_path.read_bytes()).decode("ascii"),
+                       "depth_png": base64.b64encode(depth_path.read_bytes()).decode("ascii"),
+                       "refs": refs, "prompt": prompt["prompt"],
+                       "negative": settings["negative_override"] if settings["negative_override"] is not None else prompt["negative"],
+                       "seeds": seeds, **{key: settings[key] for key in
+                           ("strength", "guidance", "control_scale", "ip_scale", "steps", "long_side")}}
+            deadline = time.monotonic() + self.style_wait_s
+            while True:
+                try:
+                    response = self.style.render(request)
+                    break
+                except StyleBusy as exc:
+                    self.progress(job, f"STYLE deferred: gpu busy free={exc.free_mb} needed={exc.needed_mb}")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise StyleError("Styling engine remained GPU busy until FORGE_STYLE_WAIT_S elapsed") from exc
+                    time.sleep(min(20, remaining))
+                    if time.monotonic() >= deadline:
+                        raise StyleError("Styling engine remained GPU busy until FORGE_STYLE_WAIT_S elapsed") from exc
+            candidates = response.get("candidates", [])
+            returned = [candidate.get("seed") for candidate in candidates]
+            if (any(type(seed) is not int for seed in returned) or len(returned) != len(seeds)
+                    or set(returned) != set(seeds)):
+                raise StyleError("Styling engine returned unexpected candidate seeds")
+            init = self.matcher.load_image(init_path)
+            # At 2048², use 1024² copies with half-size blur/erosion (see tool()).
+            size = (init.width // 2, init.height // 2)
+            small_init = init.resize(size, Image.Resampling.LANCZOS)
+            small_alpha = init.getchannel("A").resize(size, Image.Resampling.NEAREST)
+            scored = {}
+            for candidate in candidates:
+                seed = candidate["seed"]
+                data = base64.b64decode(candidate["png"], validate=True)
+                path = checked_path(ws, f"style/{view}/{seed}.png")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with Image.open(BytesIO(data)) as decoded:
+                    if (decoded.format != "PNG" or decoded.mode != "RGBA" or decoded.size != init.size
+                            or decoded.getchannel("A").tobytes() != init.getchannel("A").tobytes()):
+                        raise StyleError("Style candidate must preserve the render's RGBA frame and alpha")
+                    small = decoded.resize(size, Image.Resampling.LANCZOS)
+                path.write_bytes(data)
+                metrics = self.style_metrics.evaluate(small, small_init, small_alpha)
+                checks = self.style_check.check_png(path)
+                scored[seed] = {"metrics": metrics, "checks": checks}
+                self.client.request("POST", base + f"/style/{view}/{seed}.png", data, lease=lease)
+            chosen = max(seeds, key=lambda seed: (scored[seed]["metrics"]["pass"],
+                scored[seed]["checks"]["pass"], -scored[seed]["metrics"]["palette_drift"]))
+            result[view], result["chosen"][view] = scored, chosen
+            report["views"][view] = {"seeds": seeds, "chosen": chosen,
+                                      "metrics": {str(seed): score for seed, score in scored.items()}}
+            report["prompt_tokens"][view] = response.get("prompt_tokens")
+            report["model"] = response.get("model", "unknown")
+            score = scored[chosen]["metrics"]
+            self.progress(job, f"STYLE {view} seeds={len(seeds)} chosen={chosen} drift={score['palette_drift']} "
+                               f"change={score['change']} detail={score['detail_gain']} pass={score['pass']} "
+                               f"tokens={response.get('prompt_tokens')}")
+            if response.get("truncated"):
+                self.progress(job, f"STYLE-TRUNCATED {view}")
+        path = checked_path(ws, "style/report.json")
+        path.write_text(json.dumps(report, allow_nan=False, indent=2))
+        saved = self.client.request("POST", base + "/style", {"report": report, "lease_id": lease})
+        job["style"] = saved["style"]
+        return result
 
     def restore_workspace(self, job: dict, *, staged=False):
         # Another job for this pair may have used the shared workspace while the
@@ -495,6 +694,14 @@ class ForgeWorker:
         for view in job["canonical_views"]:
             checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(
                 self.client.request("GET", base + f"/renders/{view}.png"))
+        if job.get("style"):
+            report = self.client.request("GET", base + "/style")
+            checked_path(ws, "style/report.json").write_text(json.dumps(report, allow_nan=False, indent=2))
+            for view, entry in report["views"].items():
+                seed = entry["chosen"]
+                path = checked_path(ws, f"style/{view}/{seed}.png")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(self.client.request("GET", base + f"/style/{view}/{seed}.png"))
         if staged:
             self.copy_workspace_views(job)
         return ws
@@ -617,6 +824,10 @@ class ForgeWorker:
                     self.progress(job, line)
 
         # bake.py owns Blender's PYTHONHOME/PYTHONPATH. Only suppress bytecode.
+        if self.generate_family(job):
+            # bake.py re-resolves the spec. Do not publish the earlier render
+            # plan if a custom bake command fails to produce its own plan.
+            checked_path(target, f"blockouts/{job['asset']}/{job['variant']}/build_plan.json").unlink(missing_ok=True)
         with checked_path(backup, "bake-command.log").open("wb") as stdout:
             process = subprocess.Popen(self.bake_command(job), stdout=stdout, stderr=subprocess.STDOUT,
                                        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, start_new_session=True)
@@ -704,6 +915,17 @@ class ForgeWorker:
             artifacts["blockout/build_plan.json"] = {"encoding": "base64", "data": base64.b64encode(plan.read_bytes()).decode("ascii")}
             blockout = job["generate"]["blockout"]
             metrics["synth"] = {"confidence": blockout["confidence"], "params": blockout["params"]}
+            if job.get("style"):
+                report = json.loads(checked_path(target, "style/report.json").read_bytes())
+                names = ["style/report.json"] + [f"style/{view}/{entry['chosen']}.png"
+                                                for view, entry in report["views"].items()]
+                for name in names:
+                    artifacts[name] = {"encoding": "base64", "data": base64.b64encode(
+                        checked_path(target, name).read_bytes()).decode("ascii")}
+                metrics["style"] = {"views": {view: {"seed": entry["chosen"], **{
+                    key: entry["metrics"][str(entry["chosen"])]["metrics"][key]
+                    for key in ("pass", "palette_drift", "change", "detail_gain")}} for view, entry in report["views"].items()},
+                    **{key: report[key] for key in ("model", "refs", "prompt_tokens")}}
         return artifacts, metrics
 
     def progress(self, job: dict, *markers: str, **fields):
@@ -760,7 +982,9 @@ class ForgeWorker:
             mask = tool.match_mask(image, bg)
             rgba = image.copy()
             rgba.putalpha(mask)
-            boxes = tool.find_panels(detection)
+            # A style candidate is one full-frame view, even with detached details.
+            boxes = [mask.getbbox()] if "style_view" in metadata else tool.find_panels(detection)
+            boxes = [box for box in boxes if box is not None]
             # Crops retain all pixels inside their bbox. A contained component
             # (e.g. a detached roof detail) is already in the outer crop; emitting
             # it again would double-count the same pixels as an extra panel.
@@ -771,12 +995,14 @@ class ForgeWorker:
                 panels.append({"panel_id": f"{name}-p{index}", **metadata,
                                "bbox": list(bbox), "rgba": rgba.crop(bbox), "mask": mask.crop(bbox)})
         self.progress(job, f"MATCH panels={len(panels)}")
-        accepted, rejects = tool.match_panels([p["mask"] for p in panels], masks,
+        # Only photo/cutout panels participate in greedy silhouette assignment.
+        ordinary = [i for i, panel in enumerate(panels) if "style_view" not in panel]
+        accepted, rejects = tool.match_panels([panels[i]["mask"] for i in ordinary], masks,
                                                job["params"]["iou"], job["params"]["margin"])
-        scores = {entry["panel"]: entry for entry in accepted + rejects}
+        scores = {ordinary[entry["panel"]]: entry for entry in accepted + rejects}
         findings = []
         for index, panel in enumerate(panels):
-            entry = scores[index]
+            entry = scores.get(index, {"view": panel.get("style_view"), "iou": 1.0})
             finding = {k: v for k, v in panel.items() if k not in {"rgba", "mask"}}
             finding.update({k: v for k, v in entry.items() if k != "panel"})
             finding["auto_view"] = entry["view"] if "reason" not in entry else None
@@ -785,10 +1011,25 @@ class ForgeWorker:
             self.client.request("POST", base + f"/panels/{panel['panel_id']}", png(panel["rgba"]), lease=lease)
             self.progress(job, f"VIEW {entry['view']} iou={entry['iou']:.4f}" +
                           (f" reject={entry['reason']}" if "reason" in entry else ""))
-        claimed = sorted(entry["view"] for entry in accepted)
+        styled_views = set((job.get("style") or {}).get("views", {}))
+        for finding in findings:
+            if "style_view" in finding:
+                view, seed = finding["style_view"], finding["seed"]
+                entry = job["style"]["views"][view]
+                finding.update(source="style", **entry["metrics"][str(seed)])
+                if seed == entry["chosen"]:
+                    finding.update(decision="accept", view=view, auto_view=view)
+                    finding.pop("reason", None)
+                else:
+                    finding.update(decision="reject", reason="alternate", view=view, auto_view=view)
+            elif finding["decision"] != "reject" and finding["view"] in styled_views:
+                finding.update(decision="reject", reason="style_wins")
+        claimed = sorted(f["view"] for f in findings if f["decision"] != "reject")
         missing = sorted(set(masks) - set(claimed)
                          - set(job.get("inputs", {}).get("parent_views_inherited", [])))
-        extras = [panels[e["panel"]]["panel_id"] for e in rejects]
+        extras = [f["panel_id"] for f in findings if f["decision"] == "reject" and "style_view" not in f]
+        rejects = [{"panel": i, "view": f.get("view"), "iou": f.get("iou"), "reason": f["reason"]}
+                   for i, f in enumerate(findings) if f["decision"] == "reject"]
         return {"panels": findings, "views_claimed": claimed, "views_missing": missing,
                 "extras": extras, "rejects": rejects,
                 "extras_allowed": bool(job["params"]["allow_extra"] and not missing)}
@@ -809,6 +1050,16 @@ class ForgeWorker:
             if decision["decision"] == "reject":
                 continue
             view = decision["view"]
+            finding = next((p for p in job["match"]["panels"] if p["panel_id"] == decision["panel_id"]), {})
+            if "style_view" in finding:
+                if view != finding["style_view"]:
+                    raise ValueError("Styled candidates must stage to their original canonical view")
+                seed = finding["seed"]
+                payload = self.client.request("GET", base + f"/style/{view}/{seed}.png")
+                self.client.request("POST", base + f"/staged/views/{view}.png", payload,
+                                    lease=job["lease"]["lease_id"])
+                self.progress(job, f"VIEW {view} style seed={seed} staged")
+                continue
             panel = self.matcher.load_image(BytesIO(self.client.request(
                 "GET", base + f"/panels/{decision['panel_id']}")))
             aligned, score = self.matcher.align_to_view(panel, masks[view])
@@ -860,7 +1111,7 @@ class ForgeWorker:
             raise ValueError("Review has not been submitted.")
         with self.heartbeats(job):
             self.progress(job, f"START {job['state']} job={job['id']}")
-            empty_iteration = job["parent_job"] and not job["uploads"] and not self.generate_family(job)
+            empty_iteration = job["intent"] in {"iterate_params", "iterate_views"} and not job["uploads"]
             if self.generate_family(job):
                 if job["state"] == "matching":
                     masks = self.process_generate(job)
@@ -886,9 +1137,14 @@ class ForgeWorker:
             body["report"] = report
         suffix = "match" if job["state"] == "matching" else "staged"
         result = self.client.request("POST", f"/jobs/{job['id']}/{suffix}", body)
-        if job["state"] == "matching" and empty_iteration and not report["views_missing"]:
-            self.client.request("POST", f"/jobs/{job['id']}/review", {"mode": "submit", "panels": []})
+        palette_only = job["intent"] == "from_spec" and job["generate"]["palette_only"]
+        if job["state"] == "matching" and ((empty_iteration and not report["views_missing"])
+                                           or (palette_only and not report["panels"])):
+            self.client.request("POST", f"/jobs/{job['id']}/review", {
+                "mode": "submit", "panels": [], "views_missing": report["views_missing"]})
             claimed = self.client.request("POST", "/worker/claim", {"stages": ["review"], "job_id": job["id"]})
+            if claimed and palette_only:
+                self.progress(claimed, "MATCH skipped: palette-only authored spec")
             return self.process_match(claimed) if claimed else result
         print(f"DONE {result['state']} job={job['id']}", flush=True)
         return result

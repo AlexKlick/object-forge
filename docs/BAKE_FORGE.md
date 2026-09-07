@@ -45,6 +45,9 @@ The operator confirmed this existing directory; no bind-mount change is needed.
 | Worker | `FORGE_CRITIC_ENABLED` | Defaults on when URL is nonempty; set `0` to disable. |
 | Worker | `FORGE_ONCE` | Unset/`0` polls continuously; `1` performs one pipeline polling pass and one critic attempt, then exits. It does not drain a whole job lifecycle. |
 | Worker | `FORGE_POLL_INTERVAL` | `2` seconds; must be finite and positive. |
+| Worker | `FORGE_STYLE_URL` | Unset disables styling; HTTP loopback IP origin only, normally `http://127.0.0.1:8056`. |
+| Worker | `FORGE_STYLE_TIMEOUT_S` | `600` seconds; finite positive timeout per sidecar request. |
+| Worker | `FORGE_STYLE_WAIT_S` | `900` seconds; finite nonnegative retry budget per view for `gpu_busy`, with 20-second retries and lease heartbeats. |
 
 With an override, the API-reported path is diagnostic only and is never opened
 on the host. No generic probe-file writer exists in the current API artifact
@@ -255,6 +258,35 @@ confidence under `metrics.synth`.
 
 - `<asset>_<variant>_lod.glb`: optional bake artifact; must be fresh and pass the GLB export gate when present, with results in `metrics.glb_lod` (null and a `LOD absent` marker when absent).
 - `blockout/build_plan.json`: required generate-family artifact, retained from the workspace bake alongside `blockout/spec.yaml`.
+
+## Authored specs and styled staging (SE2)
+
+Multipart `intent=from_spec` accepts `spec_asset` (defaults to the job asset),
+`palette_only` (`1`/`true`), and optional JSON `style`. It permits zero uploads
+and refuses parents/replacement views. The worker copies the authored spec and
+optional prompt pack into its workspace, preserves declared variants, renders
+the requested variant and every declared view, and skips photo synthesis.
+Geometry and palette come from the resulting build plan. Palette-only jobs with
+zero panels auto-submit every canonical view as missing and stage an empty set;
+explicit bake approval is still required. Versions retain `blockout/spec.yaml`
+and `blockout/build_plan.json`. Authored specs refuse regeneration; their versions
+can be selected as iteration parents, including Edit blockout.
+
+Photo `generate` and authored `from_spec` jobs can enable styled staging with
+`style={"enabled":true}` and up to six `style_refs`/`style_refs[]` uploads.
+Palette-only jobs cannot style. The loopback sidecar consumes renders, their
+16-bit depth passes and optional references. All seeded candidates, checks and
+metrics are retained; the chosen seed defaults to accepted for its canonical
+view, with other seeds marked alternate. Human review remains required. Staging
+copies the candidate PNG unchanged, and bake artifacts retain `style/report.json`
+and each chosen PNG with `metrics.style`. The worker restores those job-owned
+bytes before staging and baking when another job has used the shared workspace.
+See [FORGE_WORKER.md](FORGE_WORKER.md) for report shape, routes, seed ordering,
+metric scaling and retry behavior; [STYLE_ENGINE.md](STYLE_ENGINE.md) describes
+the sidecar. Repository fakes do not establish real styling quality or GPU proof.
+
+`FORGE_BLOCKOUT_CMD` additionally accepts `{variant}` for the requested render
+variant. Overrides remain whole commands; no arguments are implicitly appended.
 
 ## Gen Ladder: iterate a blockout (GL5)
 

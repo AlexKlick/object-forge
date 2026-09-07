@@ -155,9 +155,52 @@ class ForgeStore:
             raise ForgeStoreError(f"{name} must be finite and between 1 and {maximum}.")
         return value
 
+    @staticmethod
+    def validate_style(style):
+        if style is None:
+            return None
+        defaults = {"enabled": False, "seeds_per_view": 3, "strength": 0.62,
+                    "guidance": 6.5, "control_scale": 0.8, "ip_scale": 0.6,
+                    "steps": 28, "long_side": 768, "prompt_override": None,
+                    "negative_override": None, "seed_base": 1000}
+        if not isinstance(style, dict) or set(style) - set(defaults):
+            raise ForgeStoreError("Invalid style settings.")
+        result = defaults | style
+        if type(result["enabled"]) is not bool:
+            raise ForgeStoreError("style.enabled must be boolean.")
+        bounds = {"seeds_per_view": (1, 6), "strength": (0.2, 0.95), "guidance": (1, 15),
+                  "control_scale": (0, 1.5), "ip_scale": (0, 1.5), "steps": (8, 50),
+                  "long_side": (512, 1024), "seed_base": (0, None)}
+        for key, (lo, hi) in bounds.items():
+            value = result[key]
+            integer = key in {"seeds_per_view", "steps", "long_side", "seed_base"}
+            if (type(value) not in ((int,) if integer else (int, float))
+                    or (type(value) is float and not math.isfinite(value))
+                    or value < lo or (hi is not None and value > hi)):
+                raise ForgeStoreError(f"Invalid style.{key}.")
+        if result["long_side"] % 64:
+            raise ForgeStoreError("style.long_side must be a multiple of 64.")
+        for key in ("prompt_override", "negative_override"):
+            if result[key] is not None and (not isinstance(result[key], str) or len(result[key]) > 400):
+                raise ForgeStoreError(f"style.{key} must be at most 400 characters.")
+        return result
+
+    def validate_from_spec(self, value, asset):
+        value = {} if value is None else value
+        if not isinstance(value, dict) or set(value) - {"spec_asset", "palette_only", "style"}:
+            raise ForgeStoreError("Invalid from_spec settings.")
+        palette_only = value.get("palette_only", False)
+        if type(palette_only) is not bool:
+            raise ForgeStoreError("palette_only must be boolean.")
+        style = self.validate_style(value.get("style"))
+        if palette_only and style and style["enabled"]:
+            raise ForgeStoreError("palette_only jobs cannot style")
+        return {"spec_asset": self._name(value.get("spec_asset", asset)), "palette_only": palette_only,
+                "style": style, "blockout": None, "regenerations": 0, "segment_refs": []}
+
     def validate_generate(self, value):
         value = {} if value is None else value
-        if not isinstance(value, dict) or set(value) - {"segment_refs", "height_hint", "floor_height", "blockout", "regenerations"}:
+        if not isinstance(value, dict) or set(value) - {"segment_refs", "height_hint", "floor_height", "blockout", "regenerations", "style"}:
             raise ForgeStoreError("Invalid generate settings.")
         if value.get("blockout") is not None or type(value.get("regenerations", 0)) is not int or value.get("regenerations", 0) != 0:
             raise ForgeStoreError("New generate jobs cannot supply blockouts or regenerations.")
@@ -172,7 +215,7 @@ class ForgeStore:
         return {"segment_refs": deepcopy(refs),
                 "height_hint": self._positive(value.get("height_hint", 12.0), "height_hint", 300),
                 "floor_height": self._positive(value.get("floor_height", 3.0), "floor_height", 10),
-                "blockout": None, "regenerations": 0}
+                "blockout": None, "regenerations": 0, "style": self.validate_style(value.get("style"))}
 
     def validate_edit(self, edit):
         if not isinstance(edit, dict) or not edit or set(edit) - {"height", "floor_height", "plinth_floors", "tower", "palette"}:
@@ -207,6 +250,8 @@ class ForgeStore:
     @locked
     def regenerate_blockout(self, job_id: str, hints: dict) -> dict:
         job = self.get_job(job_id)
+        if job["intent"] == "from_spec":
+            raise ForgeConflict("Authored specs are not regenerated; edit the blockout instead")
         if job["intent"] != "generate" or job["state"] != "review" or job["match"].get("submitted"):
             raise ForgeConflict("Regeneration requires an unsubmitted generate review.")
         generate = job["generate"]
@@ -242,6 +287,7 @@ class ForgeStore:
             generate["palette_hex"] = palette
         generate["regenerations"] += 1
         generate["blockout"] = None
+        job.pop("style", None)
         job["match"] = {"panels": [], "decisions": [], "views_missing": []}
         job.update(state="matching", lease=None, error=None)
         return self._save_job(job)
@@ -249,14 +295,14 @@ class ForgeStore:
     @locked
     def worker_render(self, job_id: str, view: str, payload: bytes, lease_id: str):
         job = self._worker_job(job_id, lease_id, "matching")
-        if job["intent"] not in {"generate", "iterate_blockout"} or view not in job["canonical_views"]:
+        if (not job.get("generate") or view not in job["canonical_views"]):
             raise ForgeConflict("Renders require a canonical generate view.")
         self._write_bytes(self._job_path(job_id).parent / "renders" / f"{self._name(view)}.png", payload)
 
     @locked
     def worker_blockout(self, job_id: str, payload: dict, renders: dict[str, bytes], lease_id: str):
         job = self._worker_job(job_id, lease_id, "matching")
-        if job["intent"] not in {"generate", "iterate_blockout"}:
+        if not job.get("generate"):
             raise ForgeConflict("Blockouts require generate intent.")
         required = {"params", "palette", "confidence", "assumptions", "next_view", "synth_report", "views", "spec_yaml"}
         if not isinstance(payload, dict) or set(payload) != required:
@@ -271,6 +317,8 @@ class ForgeStore:
         if set(params) != {"footprint", "height", "plinth", "tower"}:
             raise ForgeStoreError("Invalid blockout params.")
         for section, keys in ((params["footprint"], ("width", "depth")), (params["plinth"], ("floors", "floor_height"))):
+            if section is None and keys == ("floors", "floor_height"):
+                continue
             if not isinstance(section, dict) or set(section) != set(keys):
                 raise ForgeStoreError("Invalid blockout geometry.")
             for key in keys:
@@ -292,7 +340,7 @@ class ForgeStore:
             raise ForgeStoreError("Invalid blockout guidance.")
         for role, color in public["palette"].items():
             self._name(role)
-            if not isinstance(color, dict) or set(color) != {"hex"} or not isinstance(color["hex"], str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", color["hex"]):
+            if not isinstance(color, dict) or "hex" not in color or not isinstance(color["hex"], str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", color["hex"]):
                 raise ForgeStoreError("Invalid blockout palette.")
         views = self._views(public["views"])
         if not views or views != job["canonical_views"] or set(renders) - set(views):
@@ -314,7 +362,7 @@ class ForgeStore:
     @locked
     def blockout_file(self, job_id: str, name: str) -> Path:
         job = self.get_job(job_id)
-        if job["intent"] not in {"generate", "iterate_blockout"}:
+        if not job.get("generate"):
             raise FileNotFoundError("No blockout for this job.")
         if name == "spec.yaml":
             relative = "blockout/spec.yaml"
@@ -336,9 +384,9 @@ class ForgeStore:
         values = self.validate_params(params)
         views = self._views([] if canonical_views is None else canonical_views)
         replacements = self._views([] if replacement_views is None else replacement_views)
-        if intent not in {"fresh", "iterate_views", "iterate_params", "generate", "iterate_blockout"}:
+        if intent not in {"fresh", "iterate_views", "iterate_params", "generate", "from_spec", "iterate_blockout"}:
             raise ForgeStoreError("Invalid intent.")
-        if intent in {"fresh", "generate"}:
+        if intent in {"fresh", "generate", "from_spec"}:
             if parent_job is not None or parent_version is not None or replacements:
                 raise ForgeStoreError("Fresh jobs cannot have parents or replacement views.")
         else:
@@ -358,7 +406,7 @@ class ForgeStore:
             for view in inherited:
                 self.staged_view_file(parent_job, view)
         if intent == "iterate_blockout":
-            if parent["intent"] not in {"generate", "iterate_blockout"}:
+            if not parent.get("generate"):
                 raise ForgeStoreError("Blockout iteration requires a generate-family parent.")
             if "blockout/spec.yaml" not in version["artifacts"]:
                 raise ForgeStoreError("Parent version requires blockout/spec.yaml.")
@@ -371,7 +419,7 @@ class ForgeStore:
             "id": uuid4().hex, "asset": asset, "variant": variant,
             "parent_job": parent_job, "parent_version": parent_version, "intent": intent,
             "state": "uploaded", "params": values, "canonical_views": views,
-            "replacement_views": replacements, "uploads": [],
+            "replacement_views": replacements, "uploads": [], "style_refs": [],
             "inputs": {"parent_views_inherited": list(inherited)},
             "match": {"panels": [], "decisions": [], "views_missing": []},
             "created_at": self._now().isoformat(), "updated_at": self._now().isoformat(),
@@ -379,6 +427,8 @@ class ForgeStore:
         }
         if intent == "generate":
             job["generate"] = self.validate_generate(generate)
+        elif intent == "from_spec":
+            job["generate"] = self.validate_from_spec(generate, asset)
         elif intent == "iterate_blockout":
             if not isinstance(generate, dict) or set(generate) != {"edit"}:
                 raise ForgeStoreError("Blockout iteration requires generate.edit only.")
@@ -389,6 +439,13 @@ class ForgeStore:
                                                 or list(parent["inputs"].get("parent_uploads", [])))
         elif generate is not None:
             raise ForgeStoreError("Generate settings require generate intent.")
+        elif intent in {"iterate_params", "iterate_views"} and parent.get("generate"):
+            # A generated version's spec belongs to the selected version, never
+            # to the companion tree. Descendants keep workspace execution.
+            self.artifact_file(asset, variant, parent_version, "blockout/spec.yaml")
+            job["generate"] = deepcopy(parent["generate"])
+            job["generate"].update(style=None, segment_refs=[])
+            job["inputs"]["workspace_parent"] = True
         return self._save_job(job)
 
     @locked
@@ -440,6 +497,86 @@ class ForgeStore:
         job["uploads"].append(record)
         self._save_job(job)
         return record
+
+    @locked
+    def record_style_ref(self, job_id: str, filename: str, media_type: str, data: bytes) -> dict:
+        job = self.get_job(job_id)
+        refs = job.setdefault("style_refs", [])
+        if job["state"] != "uploaded":
+            raise ForgeConflict("Style references require an uploaded job.")
+        if len(refs) >= 6:
+            raise ForgeStoreError("At most six style references are allowed.")
+        if media_type not in _IMAGE_EXT or not data:
+            raise ForgeStoreError("A supported, nonempty image is required.")
+        index = len(refs)
+        self._write_bytes(self._job_path(job_id).parent / "style/refs" / f"{index}.{_IMAGE_EXT[media_type]}", data)
+        record = {"index": index, "filename": Path(filename).name[:240], "media_type": media_type}
+        refs.append(record)
+        self._save_job(job)
+        return record
+
+    @locked
+    def style_ref_file(self, job_id: str, n: int) -> tuple[Path, str]:
+        job = self.get_job(job_id)
+        ref = next((r for r in job.get("style_refs", []) if r["index"] == n), None)
+        if ref is None:
+            raise FileNotFoundError("Style reference not found.")
+        return (self._file(self._job_path(job_id).parent / "style/refs" / f"{n}.{_IMAGE_EXT[ref['media_type']]}"),
+                ref["media_type"])
+
+    def _style_path(self, job_id: str, view: str, seed: int) -> Path:
+        job = self.get_job(job_id)
+        self._name(view)
+        if job["canonical_views"] and view not in job["canonical_views"]:
+            raise ForgeStoreError("Unknown style view.")
+        if type(seed) is not int or seed < 0:
+            raise ForgeStoreError("Style seed must be a non-negative integer.")
+        return self._checked(self._job_path(job_id).parent / "style" / view / f"{seed}.png")
+
+    @locked
+    def worker_style_candidate(self, job_id: str, view: str, seed: int, png_bytes: bytes, lease_id: str):
+        self._worker_job(job_id, lease_id, "matching")
+        self._write_bytes(self._style_path(job_id, view, seed), png_bytes)
+
+    @locked
+    def style_candidate_file(self, job_id: str, view: str, seed: int) -> Path:
+        return self._file(self._style_path(job_id, view, seed))
+
+    @locked
+    def worker_style_report(self, job_id: str, report: dict, lease_id: str):
+        job = self._worker_job(job_id, lease_id, "matching")
+        if not isinstance(report, dict) or set(report) != {"views", "prompt_tokens", "model", "refs", "params"}:
+            raise ForgeStoreError("Invalid style report fields.")
+        if not isinstance(report["views"], dict) or set(report["views"]) != set(job["canonical_views"]):
+            raise ForgeStoreError("Style report must cover canonical views.")
+        if (type(report["refs"]) is not int or report["refs"] != len(job.get("style_refs", []))
+                or not isinstance(report["model"], str) or not isinstance(report["prompt_tokens"], dict)):
+            raise ForgeStoreError("Invalid style report metadata.")
+        if not isinstance(report["params"], dict):
+            raise ForgeStoreError("Style report params must be an object.")
+        self.validate_style(report["params"])
+        for view, entry in report["views"].items():
+            if not isinstance(entry, dict) or set(entry) != {"seeds", "chosen", "metrics"}:
+                raise ForgeStoreError("Invalid style view report.")
+            seeds = entry["seeds"]
+            if (not isinstance(seeds, list) or not 1 <= len(seeds) <= 6
+                    or any(type(seed) is not int or seed < 0 for seed in seeds)
+                    or len(set(seeds)) != len(seeds) or type(entry["chosen"]) is not int
+                    or entry["chosen"] not in seeds or not isinstance(entry["metrics"], dict)
+                    or set(entry["metrics"]) != {str(seed) for seed in seeds}):
+                raise ForgeStoreError("Invalid style seeds or metrics.")
+            for seed in seeds:
+                self.style_candidate_file(job_id, view, seed)
+        json.dumps(report, allow_nan=False)
+        self._write_json(self._job_path(job_id).parent / "style/report.json", report)
+        job["style"] = deepcopy(report)
+        return self._save_job(job)
+
+    @locked
+    def get_style_report(self, job_id: str) -> dict:
+        if not self.get_job(job_id).get("style"):
+            raise FileNotFoundError("No style report for this job.")
+        return self._read(self._file(self._job_path(job_id).parent / "style/report.json"))
 
     @locked
     def upload_file(self, job_id: str, index: int) -> tuple[Path, str]:
@@ -694,7 +831,7 @@ class ForgeStore:
     @staticmethod
     def _summary(version: dict) -> dict:
         return {key: version[key] for key in ("number", "asset", "variant", "origin", "job_id",
-                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", []), "critic": version.get("critic", {"status": "pending"})}
+                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", []), "critic": version.get("critic", {"status": "pending"}), "style": version.get("style", version.get("metrics", {}).get("style"))}
 
     @locked
     def claim_critic(self) -> dict | None:

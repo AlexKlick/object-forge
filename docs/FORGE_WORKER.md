@@ -27,6 +27,9 @@ Worker environment:
 | `FORGE_CRITIC_URL` | `http://127.0.0.1:18001/v1`; HTTP localhost, 127.0.0.1 or ::1 only |
 | `FORGE_CRITIC_MODEL` | `Qwen/Qwen3.5-4B` |
 | `FORGE_CRITIC_ENABLED` | Enabled when URL is nonempty; `0` disables; truthy values: `1`, `true`, `yes`, `on` |
+| `FORGE_STYLE_URL` | Unset disables styling; HTTP loopback IP origin, normally `http://127.0.0.1:8056`; no proxies or redirects |
+| `FORGE_STYLE_TIMEOUT_S` | `600`; positive finite HTTP timeout per request |
+| `FORGE_STYLE_WAIT_S` | `900`; nonnegative finite GPU-busy retry budget per view; retry every 20 seconds with lease heartbeats |
 
 The worker inserts `<spike>/tools` into `sys.path`, disables bytecode writes, and
 imports `sheet_match` read-only. It never calls the tool's writing `run`/`main`
@@ -168,6 +171,50 @@ from the harvested Blender log and the threshold from the read-only
 
 ## Gen Ladder worker lanes
 
+**SE2 `from_spec` jobs** copy `<spike>/specs/<spec_asset>.yaml` and its optional
+prompt pack into the workspace without synthesis. `spec_asset` defaults to the
+job asset; aliases rewrite the top-level asset name. Declared variants and all
+spec views are preserved, including seven-view buildings. Rendering uses the
+requested variant and its depth passes. A missing variant gets an empty alias.
+Review geometry uses the build-plan bounding box and post-variant palette.
+`palette_only=true` with no panels auto-submits all canonical views as missing
+and stages an empty set; bake still needs explicit approval and uses
+`--allow-palette-only`. Authored specs cannot regenerate; edit their blockout.
+Parameter/view iterations of generated versions also use the workspace lock and
+selected version's retained spec, with parent renders copied through the API;
+they never fall back to the spike bake path. Blockout edits rerender all spec views.
+
+**Styled staging** is optional on photo `generate` and `from_spec` jobs through
+JSON `style` settings (`enabled=true`); palette-only jobs cannot enable it.
+Up to six `style_refs`/`style_refs[]` images are separate from synthesis uploads.
+The worker converts references to PNG for the sidecar, supplies the exact render
+and 16-bit depth pass, and retains every candidate under `style/<view>/<seed>.png`.
+Prompts use the copied pack's short description, with style tags, palette roles
+and view; overrides replace the body or negative text. The seeds for each view
+are `seed_base + 100*i + view_index` in sorted canonical-view order.
+
+Metrics run on half-resolution copies (1024² for 2048² frames), with blur radii
+and erosion halved: full-frame floating-point Lab blurs cost seconds per image.
+Ranking uses metrics pass, PNG-check pass, then lowest palette drift. The chosen
+candidate becomes the view's default accepted finding and other seeds are
+rejected as alternates. Style wins over photo matches for that view. This remains
+an unsubmitted human review even if all candidates fail their checks.
+On submit, staging copies the full-frame PNG unchanged, preserving render alpha.
+Candidates can only stage to their original view. Job-owned style reports and
+chosen PNGs are restored before staging/baking and copied into version artifacts;
+`metrics.style` records, per view, the chosen seed with its `pass`, `palette_drift`,
+`change` (the "did styling happen" gate) and `detail_gain`, plus model, refs and tokens.
+`STYLE`, `STYLE-TRUNCATED`, and GPU-busy deferred markers are retained in the log.
+Missing depth, an unconfigured requested style engine, or a variant with no
+`short`/`descriptions` prompt entry (and no `prompt_override`) fails with a clear error
+before any sidecar request.
+
+Style routes beneath `/v1/forge/jobs/{id}` are `GET style/refs/{n}`,
+`GET/POST style/{view}/{seed}.png`, and `GET/POST style`. Worker writes require a
+current matching lease; PNG POST uses `X-Forge-Lease` and at most 24 MiB, while
+report POST uses JSON `{report, lease_id}`. The report's `prompt_tokens` maps
+view to token count; each view's `metrics` maps seed strings to `{metrics, checks}`.
+
 **GL1 imports do not enter the worker queue.** Capture publishes completed runs
 with `POST /v1/ui/runs/{record_key}/library` and JSON `asset`/`variant`.
 Publication returns 201, or 200 for the existing version on a repeat record key,
@@ -273,7 +320,7 @@ continue to use spike snapshot/restore as described above.
 | Override | Placeholder contract |
 | --- | --- |
 | `FORGE_SYNTH_CMD` | `{inputs}`, `{asset}`, `{out}`, `{height_hint}`, `{floor_height}`, `{report}`; GL5 also provides `{edit_in}`, `{edit}`. `{out}` is the output spec and `{report}` is the synthesis/edit report. |
-| `FORGE_BLOCKOUT_CMD` | `{spec}`, `{out}`; input spec and workspace assets root (renders go beneath `renders/`). |
+| `FORGE_BLOCKOUT_CMD` | `{spec}`, `{out}`, `{variant}`; input spec, workspace assets root, and render variant (renders go beneath `renders/`). |
 | `FORGE_BAKE_CMD` | `{assets_root}`, `{spec}`; workspace assets root and spec for generate-family jobs, spike paths for ordinary bakes. |
 
 Overrides are whole argument lists, tokenized with `shlex.split` before
