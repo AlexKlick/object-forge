@@ -381,3 +381,18 @@ kbd { min-width: 44px; padding: 4px 6px; border: 1px solid var(--line-strong); b
 .forge-panel-list [data-decision=accept] { border-color: #7be39a; }
 .forge-panel-list [data-decision=reject] { border-color: #ff727c; }
 .forge-panel-list [aria-pressed=true] { outline: 2px solid #62a8ff; }
+
+/* Unattended policy and human attention. */
+.main-tabs { flex-wrap: wrap; }
+.forge-status-line, .forge-job-chips, .forge-policy-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.forge-badge.policy-enforce { background: #164d35; color: #a5efc8; }
+.forge-badge.policy-advisory, .forge-badge.policy-flagged { background: #684b12; color: #ffe0a0; }
+.forge-badge.policy-off { color: var(--muted); }
+.forge-policy-chips .forge-badge { overflow-wrap: anywhere; }
+.forge-policy-author { display: grid; gap: 8px; max-width: 240px; color: var(--muted); font-size: 13px; }
+.forge-attention-list { display: grid; gap: 16px; }
+.forge-attention-card { margin-bottom: 0; overflow-wrap: anywhere; }
+.forge-attention-card li { margin-block: 8px; white-space: pre-wrap; }
+.forge-attention-card time { display: block; margin-bottom: 16px; color: var(--muted); font-size: 13px; }
+.detail-policy { color: var(--muted); overflow-wrap: anywhere; }
+.forge-review > pre { white-space: pre-wrap; overflow-wrap: anywhere; }

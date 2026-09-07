@@ -14,12 +14,49 @@ const button = (text, action, style = "secondary") => `<button type="button" cla
 const criticBadge = (status = "pending") => `<span class="forge-badge critic-${["pass", "warn", "fail"].includes(status) ? status : "neutral"}">Critic: ${esc(status)}</span>`;
 const guard = (fn) => async (...args) => { try { await fn(...args); } catch (error) { toast(error.message, true); } };
 
+// One policy snapshot supplies both the status chip and the initial library filter.
+let policyRequest;
+const readPolicy = () => policyRequest ??= api(`${forge}/policy`);
+const policyAuthorKey = "forge-policy-author";
+let policyAuthor = "owner";
+try { policyAuthor = localStorage.getItem(policyAuthorKey)?.trim() || "owner"; } catch { /* Keep the session default if storage is unavailable. */ }
+const policyAuthorField = () => `<label class="forge-policy-author">Override author<input class="text-control" data-policy-author value="${esc(policyAuthor)}" maxlength="128" required></label>`;
+function bindPolicyAuthor(root) {
+  $("[data-policy-author]", root).oninput = (event) => {
+    policyAuthor = event.target.value;
+    for (const input of document.querySelectorAll("[data-policy-author]")) if (input !== event.target) input.value = policyAuthor;
+    try { localStorage.setItem(policyAuthorKey, policyAuthor); } catch { /* Overrides remain available for this session. */ }
+  };
+}
+function jobPolicyChips(job) {
+  const chips = [];
+  const policy = job.policy || {};
+  if (policy.review?.actor === "policy" && policy.review.applied) chips.push(["auto-staged", "policy-enforce"]);
+  if (policy.bake?.actor === "policy" && policy.bake.applied) chips.push(["auto-approved", "policy-enforce"]);
+  if (job.attention) chips.push([`escalated: ${job.attention.reason}`, "policy-flagged"]);
+  if (policy.mode === "advisory") {
+    for (const stage of ["review", "bake", "version"]) {
+      const decision = policy[stage];
+      if (decision?.actor === "policy" && !decision.applied) chips.push([`advisory: ${decision.action}`, "policy-advisory"]);
+    }
+  }
+  return chips.map(([label, style]) => `<span class="forge-badge ${style}">${esc(label)}</span>`).join("");
+}
+function versionPolicyText(version) {
+  if (version.attention) return `flagged: ${version.attention.detail.join("; ") || version.attention.reason}`;
+  const policy = version.policy;
+  if (policy?.action === "flag") return `flagged: ${policy.reasons.join("; ")}`;
+  if (policy?.actor === "policy" && policy.action === "accept" && policy.applied && version.accepted) return "accepted by policy";
+  return "no policy decision";
+}
+
 function showTab(name) {
   for (const tab of document.querySelectorAll("[data-main-tab]")) {
     tab.setAttribute("aria-selected", String(tab.dataset.mainTab === name));
   }
   for (const panel of document.querySelectorAll("[data-main-panel]")) panel.hidden = panel.dataset.mainPanel !== name;
   if (name === "library") library.refresh().catch((error) => toast(error.message, true));
+  if (name === "attention") attention.refresh().catch((error) => toast(error.message, true));
   if (name === "forge") board.refreshPickers().catch((error) => toast(error.message, true));
 }
 
@@ -66,7 +103,7 @@ class BoardView {
     this.parents = [];
     this.jobs = new Map();
     this.parentRequest = 0;
-    root.innerHTML = `<div class="forge-heading"><div><p class="eyebrow">Sheets → review → bake</p><h1>Bake Forge</h1></div><span id="forgeStatus" role="status">Checking worker store…</span></div>
+    root.innerHTML = `<div class="forge-heading"><div><p class="eyebrow">Sheets → review → bake</p><h1>Bake Forge</h1></div><div class="forge-status-line"><span id="forgeStatus" role="status">Checking worker store…</span><span id="forgePolicy" class="forge-badge" role="status">Policy: loading…</span></div></div>
       <form id="forgeForm" class="forge-surface">
         <div class="forge-fields"><label>Asset<input name="asset" required class="text-control" list="forgeAssets" placeholder="asset id"></label><datalist id="forgeAssets"></datalist>
         <label>Variant<input name="variant" required class="text-control" list="forgeVariants" placeholder="variant id"></label><datalist id="forgeVariants"></datalist></div>
@@ -135,6 +172,13 @@ class BoardView {
   }
 
   async start() {
+    readPolicy().then((policy) => {
+      const chip = $("#forgePolicy");
+      chip.textContent = `Policy: ${policy.mode}`;
+      chip.className = `forge-badge policy-${policy.mode}`;
+      chip.title = Object.entries(policy.thresholds).map(([key, value]) => `${key}: ${value}`).join("\n");
+    }).catch((error) => { $("#forgePolicy").textContent = "Policy: unavailable"; $("#forgePolicy").title = error.message; });
+    await attention.refresh().catch(() => {});
     try {
       const status = await api(`${forge}/status`);
       $("#forgeStatus").textContent = status.enabled ? "Forge enabled" : "Forge disabled";
@@ -144,8 +188,15 @@ class BoardView {
     // Serialized timeout polling avoids overlapping responses and duplicate log lines.
     const poll = async () => {
       try {
-        for (const [id, card] of this.jobs) {
-          if (!["ready", "failed"].includes(card.job.state)) this.card(await api(`${forge}/jobs/${id}`));
+        if (Date.now() - (this.policyPolledAt || 0) >= 10000) {
+          // Include ready jobs: a later critic verdict can add or clear attention.
+          await attention.refresh().catch(() => {});
+          for (const job of await api(`${forge}/jobs`)) this.card(job);
+          this.policyPolledAt = Date.now();
+        } else {
+          for (const [id, card] of this.jobs) {
+            if (!["ready", "failed"].includes(card.job.state)) this.card(await api(`${forge}/jobs/${id}`));
+          }
         }
       } catch (error) { $("#forgeStatus").textContent = `Polling error: ${error.message}`; }
       this.pollTimer = setTimeout(poll, 2000);
@@ -309,7 +360,7 @@ class BoardView {
     let card = this.jobs.get(job.id);
     if (!card) {
       const root = document.createElement("article"); root.className = "forge-surface forge-job";
-      root.innerHTML = `<div class="forge-heading"><h2>${esc(job.asset)} / ${esc(job.variant)}</h2><span class="forge-state"></span></div><small>${esc(job.id)} · ${esc(job.intent)}</small><pre class="forge-log" aria-label="Worker marker log"></pre><p class="forge-error" role="alert"></p><div class="forge-job-actions"></div><div class="forge-blockout-review" hidden></div><div class="forge-style-review" hidden></div><div class="forge-review" hidden></div>`;
+      root.innerHTML = `<div class="forge-heading"><h2>${esc(job.asset)} / ${esc(job.variant)}</h2><div class="forge-job-chips"><span class="forge-state"></span><span class="forge-policy-chips"></span></div></div><small>${esc(job.id)} · ${esc(job.intent)}</small><pre class="forge-log" aria-label="Worker marker log"></pre><p class="forge-error" role="alert"></p><div class="forge-job-actions"></div><div class="forge-blockout-review" hidden></div><div class="forge-style-review" hidden></div><div class="forge-review" hidden></div>`;
       $("#forgeJobs").prepend(root); card = { root, log: [], job }; this.jobs.set(job.id, card);
       $(".forge-review", root).addEventListener("forge:decisions", () => card.style?.drawChosen());
     }
@@ -323,10 +374,18 @@ class BoardView {
       card.revision = revision;
     }
     const review = () => {
+      card.reviewOpen = true;
+      const root = $(".forge-review", card.root);
+      if (card.job.state !== "review" || card.job.match.submitted) {
+        root.innerHTML = `<h3>Match review</h3><p>Recorded decisions · ${esc(card.job.state)}</p><pre>${pretty(card.job.match)}</pre>`;
+        root.hidden = false;
+        return null;
+      }
       if (!card.review) card.review = new MatchReview($(".forge-review", card.root), card.job, (updated) => this.card(updated));
       $(".forge-review", card.root).hidden = false;
       return card.review;
     };
+    card.openReview = review;
     const styleRoot = $(".forge-style-review", card.root);
     styleRoot.hidden = !job.style || job.state !== "review" || job.match.submitted;
     if (!styleRoot.hidden) {
@@ -337,6 +396,7 @@ class BoardView {
       } else { card.style.job = job; card.style.drawChosen(); }
     }
     const chip = $(".forge-state", card.root); chip.textContent = job.state; chip.dataset.state = job.state;
+    $(".forge-policy-chips", card.root).innerHTML = jobPolicyChips(job);
     const lines = job.worker_log || [];
     // The API retains a rolling tail. Match its largest overlap to append only new lines.
     let overlap = Math.min(card.log.length, lines.length);
@@ -362,6 +422,7 @@ class BoardView {
     if (job.state !== "review" || job.match.submitted) {
       $(".forge-review", card.root).hidden = true;
       card.review = null;
+      if (card.reviewOpen) review();
     }
   }
 }
@@ -614,7 +675,99 @@ class MatchReview {
       await this.saves;
       const job = await api(`${forge}/jobs/${this.job.id}/review`, json(this.payload("submit")));
       this.updated(job); toast("Review submitted. Waiting for staging.");
-    } finally { this.submitting = false; $(".forge-submit", this.root).disabled = false; }
+    } finally {
+      this.submitting = false;
+      const submit = $(".forge-submit", this.root);
+      if (submit) submit.disabled = false;
+    }
+  }
+}
+
+class AttentionView {
+  constructor(root) {
+    this.root = root; this.pending = null; this.overriding = new Set();
+    root.innerHTML = `<div class="forge-heading"><h1>Attention</h1>${policyAuthorField()}</div><p class="attention-status" role="status">Loading attention…</p><div class="forge-attention-list"></div>`;
+    bindPolicyAuthor(root);
+  }
+
+  refresh() {
+    if (this.pending) return this.pending;
+    this.pending = this.load().catch((error) => {
+      $(".attention-status", this.root).textContent = `Attention unavailable: ${error.message}`;
+      $("#attentionCount").textContent = "?";
+      throw error;
+    }).finally(() => { this.pending = null; });
+    return this.pending;
+  }
+
+  async load() {
+    const entries = await api(`${forge}/attention`);
+    const count = entries.jobs.length + entries.versions.length;
+    $("#attentionCount").textContent = String(count);
+    $(".attention-status", this.root).textContent = count ? `${entries.jobs.length} jobs · ${entries.versions.length} versions` : "Nothing needs attention.";
+    const list = $(".forge-attention-list", this.root); list.replaceChildren();
+    for (const [kind, records] of Object.entries(entries)) {
+      for (const record of records) {
+        const isJob = kind === "jobs";
+        const jobId = isJob ? record.id : record.job_id;
+        const card = document.createElement("article"); card.className = "forge-surface forge-attention-card";
+        card.innerHTML = `<div class="forge-heading"><h2>${esc(record.asset)} / ${esc(record.variant)}${isJob ? "" : ` · v${record.number}`}</h2><span class="forge-badge policy-flagged">${esc(record.state)}</span></div>
+          <small>${esc(isJob ? record.id : `Version ${record.number}`)}</small><p>${esc(record.attention.reason)}</p>
+          <ul>${record.attention.detail.map((line) => `<li>${esc(line)}</li>`).join("")}</ul>
+          <time datetime="${esc(record.attention.at)}">${esc(record.attention.at)}</time>
+          <div class="button-row">${isJob ? button("Review", "review") + button("Override: submit", "submit") + button("Override: approve", "approve") : button("Open", "open") + button("Override: accept", "accept")}${button("Dismiss", "dismiss")}</div>`;
+        for (const control of card.querySelectorAll("[data-action]")) {
+          if (["submit", "approve", "accept", "dismiss"].includes(control.dataset.action)) {
+            const allowed = !!jobId && !(control.dataset.action === "submit" && (record.state !== "review" || record.match.submitted)) && !(control.dataset.action === "approve" && record.state !== "staged");
+            control.dataset.overrideAllowed = String(allowed);
+            control.disabled = !allowed || this.overriding.has(jobId);
+          }
+        }
+        card.onclick = guard(async (event) => {
+          const control = event.target.closest("[data-action]");
+          if (!control || control.disabled) return;
+          const action = control.dataset.action;
+          if (action === "review") {
+            const job = await api(`${forge}/jobs/${encode(jobId)}`);
+            showTab("forge"); board.card(job);
+            const target = board.jobs.get(job.id); target.openReview(); target.root.scrollIntoView({ behavior: "smooth" });
+          } else if (action === "open") { showTab("library"); await detail.open(record); }
+          else {
+            control.disabled = true;
+            try { await this.override(jobId, action); } finally { control.disabled = false; }
+          }
+        });
+        card.dataset.policyJob = jobId || "";
+        list.append(card);
+      }
+    }
+  }
+
+  async override(jobId, action) {
+    const author = policyAuthor.trim();
+    if (!author) throw new Error("Enter an override author.");
+    if (!jobId) throw new Error("This version has no job to override.");
+    if (this.overriding.has(jobId)) return;
+    this.overriding.add(jobId);
+    try {
+      const job = await api(`${forge}/jobs/${encode(jobId)}/policy/override`, json({ action, author }));
+      board.card(job);
+      toast(`Override ${action} saved.`);
+      // Drain any read begun before the write, then fetch the new attention state.
+      await this.pending?.catch(() => {});
+      await this.refresh();
+      if (!$("#libraryWorkspace").hidden) await library.refresh();
+      if (!detail.root.hidden && detail.version?.job_id === jobId) await detail.open(detail.version);
+    } finally {
+      this.overriding.delete(jobId);
+      for (const card of this.root.querySelectorAll("[data-policy-job]")) {
+        if (card.dataset.policyJob !== jobId) continue;
+        for (const control of card.querySelectorAll("[data-override-allowed]")) control.disabled = control.dataset.overrideAllowed !== "true";
+      }
+      if (detail.version?.job_id === jobId) {
+        for (const control of detail.root.querySelectorAll('[data-action^="policy-"]')) control.disabled = false;
+      }
+    }
   }
 }
 
@@ -624,12 +777,18 @@ class LibraryView {
     root.innerHTML = `<div class="forge-heading"><div><p class="eyebrow">Baked versions and lineage</p><h1>Library</h1></div></div><div class="forge-fields forge-surface"><label>Search<input id="libraryQuery" class="text-control" type="search" placeholder="Asset, variant, note…"></label><label>Origin<select id="libraryOrigin" class="select-control"><option value="">All origins</option><option>bake</option><option>trellis</option></select></label><label class="forge-check"><input id="libraryAccepted" type="checkbox"> Accepted only</label>${button("Refresh", "refresh")}</div><div id="libraryGrid"></div>`;
     let debounce;
     $("#libraryQuery").oninput = () => { clearTimeout(debounce); debounce = setTimeout(guard(() => this.refresh()), 250); };
-    for (const id of ["#libraryOrigin", "#libraryAccepted"]) $(id).onchange = guard(() => this.refresh());
+    $("#libraryOrigin").onchange = guard(() => this.refresh());
+    $("#libraryAccepted").onchange = guard(() => { this.acceptedTouched = true; return this.refresh(); });
+    this.policyReady = readPolicy().then((policy) => {
+      if (!this.acceptedTouched) $("#libraryAccepted").checked = policy.mode === "enforce";
+    }).catch((error) => toast(`Library policy unavailable: ${error.message}`, true));
     $("[data-action=refresh]", root).onclick = guard(() => this.refresh());
   }
 
   async refresh() {
     const request = ++this.request;
+    await this.policyReady;
+    if (request !== this.request) return;
     const query = new URLSearchParams();
     if ($("#libraryQuery").value) query.set("q", $("#libraryQuery").value);
     if ($("#libraryOrigin").value) query.set("origin", $("#libraryOrigin").value);
@@ -650,6 +809,7 @@ class LibraryView {
         const frame = version.artifacts?.find((name) => name.startsWith("turntable/") && name.endsWith(".png")) || (version.metrics.turntable_frames ? "turntable/tt_00.png" : null);
         card.innerHTML = `${frame ? `<img src="${artifactPath(version, frame)}" alt="First turntable frame" loading="lazy">` : '<div class="forge-no-thumb">No turntable</div>'}<strong>${version.accepted ? "★ " : ""}v${version.number}</strong><span class="forge-badge">${esc(version.origin)}</span><span class="forge-lineage">${lineage(version)}</span><small>${esc(version.state || "ready")}</small>`;
         card.innerHTML += criticBadge(version.critic?.status);
+        if (version.attention) card.innerHTML += '<span class="forge-badge policy-flagged">flagged</span>';
         if (version.style || version.metrics?.style) card.innerHTML += '<span class="forge-badge">styled</span>';
         card.onclick = guard(() => detail.open(version)); $(".forge-version-grid", section).append(card);
       }
@@ -660,7 +820,8 @@ class LibraryView {
 class VersionDetail {
   constructor(root) {
     this.root = root; this.loading = Promise.resolve(); this.request = 0;
-    root.innerHTML = `<div class="forge-heading"><h2 class="detail-title"></h2>${button("Close detail", "close")}</div><div class="detail-actions button-row"></div><div class="forge-detail-grid"><div><div class="mesh-viewer forge-viewer"></div><p class="detail-viewer-status" role="status"></p><div class="detail-layers"></div></div><div><div class="detail-filmstrip"></div><nav class="forge-subtabs" aria-label="Version detail tabs">${["Bake report", "Views", "History", "Critic"].map((name) => button(name, name)).join("")}</nav><div class="detail-content"></div></div></div><div class="detail-blockout-edit"></div><form class="detail-note" hidden><label>Author<input name="author" class="text-control" value="owner" required maxlength="128"></label><label>Note<textarea name="text" class="text-control" required maxlength="10000"></textarea></label><button class="button primary">Save note</button></form><dialog class="forge-lightbox"><button type="button" class="button secondary">Close</button><img alt="Turntable frame"></dialog>`;
+    root.innerHTML = `<div class="forge-heading"><div><h2 class="detail-title"></h2><p class="detail-policy"></p></div>${button("Close detail", "close")}</div><div class="detail-policy-author" hidden>${policyAuthorField()}</div><div class="detail-actions button-row"></div><div class="forge-detail-grid"><div><div class="mesh-viewer forge-viewer"></div><p class="detail-viewer-status" role="status"></p><div class="detail-layers"></div></div><div><div class="detail-filmstrip"></div><nav class="forge-subtabs" aria-label="Version detail tabs">${["Bake report", "Views", "History", "Critic"].map((name) => button(name, name)).join("")}</nav><div class="detail-content"></div></div></div><div class="detail-blockout-edit"></div><form class="detail-note" hidden><label>Author<input name="author" class="text-control" value="owner" required maxlength="128"></label><label>Note<textarea name="text" class="text-control" required maxlength="10000"></textarea></label><button class="button primary">Save note</button></form><dialog class="forge-lightbox"><button type="button" class="button secondary">Close</button><img alt="Turntable frame"></dialog>`;
+    bindPolicyAuthor(root);
     $("[data-action=close]", root).onclick = () => { root.hidden = true; ++this.request; };
     $(".forge-lightbox button", root).onclick = () => $("dialog", root).close();
     $(".forge-subtabs", root).onclick = (event) => { const name = event.target.closest("[data-action]")?.dataset.action; if (name) this.tab(name); };
@@ -765,9 +926,19 @@ class VersionDetail {
     this.root.hidden = false;
     $(".detail-title", this.root).textContent = `${version.asset} / ${version.variant} · ${lineage(version)}`;
     $(".detail-actions", this.root).innerHTML = button(version.accepted ? "★ Accepted · unstar" : "☆ Accept", "accept") + (version.origin === "trellis" ? "" : button("Iterate", "iterate", "accent")) + (version.artifacts.includes("blockout/spec.yaml") ? button("Edit blockout", "edit-blockout", "accent") : "") + button("Add note", "note");
+    $(".detail-policy", this.root).textContent = `Policy: ${versionPolicyText(version)}`;
+    $(".detail-policy-author", this.root).hidden = !version.attention;
+    if (version.attention) {
+      $(".detail-actions", this.root).innerHTML += button("Override: accept", "policy-accept") + button("Dismiss", "policy-dismiss");
+      for (const control of this.root.querySelectorAll('[data-action^="policy-"]')) control.disabled = !version.job_id || attention.overriding.has(version.job_id);
+    }
     $(".detail-actions", this.root).onclick = guard(async (event) => {
       const action = event.target.closest("[data-action]")?.dataset.action;
       if (action === "accept") { await api(`${versionPath(version)}/accept`, json({ accepted: !version.accepted })); await this.open(version); await library.refresh(); }
+      if (action === "policy-accept" || action === "policy-dismiss") {
+        const control = event.target.closest("button"); control.disabled = true;
+        try { await attention.override(version.job_id, action.slice(7)); } finally { control.disabled = false; }
+      }
       if (action === "iterate") await board.iterate(version);
       if (action === "edit-blockout") this.editBlockout();
       if (action === "note") { $(".detail-note", this.root).hidden = false; $("textarea", this.root).focus(); }
@@ -883,6 +1054,7 @@ class VersionDetail {
   }
 }
 
+const attention = new AttentionView($("#attentionPanel"));
 const library = new LibraryView($("#libraryPanel"));
 const detail = new VersionDetail($("#versionDetail"));
 const board = new BoardView($("#forgePanel"));

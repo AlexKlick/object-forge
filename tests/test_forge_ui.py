@@ -172,7 +172,9 @@ console.log('Multipart mode probe passed');
         shell.feed((WEB / "index.html").read_text())
         self.assertEqual(shell.stack, [])
         self.assertEqual(len(shell.ids), len(set(shell.ids)))
-        self.assertEqual(shell.tabs, ["capture", "forge", "library"])
+        self.assertEqual(shell.tabs, ["capture", "forge", "library", "attention"])
+        self.assertIn("attentionPanel", shell.ids)
+        self.assertIn("attentionCount", shell.ids)
         for name in ("app", "viewer", "forge"):
             self.assertIn(f"/assets/{name}.js", shell.scripts)
         for name in ("selectionCanvas", "imageInput", "meshViewer", "resultSection"):
@@ -222,6 +224,158 @@ console.log('Multipart mode probe passed');
         self.assertIn('version.job_id == null ? {} : api(', forge)
         self.assertIn('if (v.job_id == null)', forge)
         self.assertIn('pretty(v.inputs.run || {})', forge)
+
+    def test_unattended_policy_attention_and_override_seams(self):
+        source = (WEB / "forge.js").read_text()
+        for token in ('${forge}/policy', '${forge}/attention', 'policy/override',
+                      'auto-staged', 'auto-approved', 'escalated:', 'advisory:',
+                      'Override: submit', 'Override: approve', 'Override: accept', 'Dismiss',
+                      'flagged', 'accepted by policy', 'no policy decision',
+                      'forge-policy-author', 'localStorage.getItem(policyAuthorKey)',
+                      'localStorage.setItem(policyAuthorKey, policyAuthor)', 'json({ action, author })',
+                      'policy.mode === "enforce"', 'policy.thresholds', 'chip.title',
+                      'record.attention.reason', 'record.attention.detail', 'record.attention.at',
+                      'if (this.pending) return this.pending', 'target.openReview()',
+                      'scrollIntoView', '10000'):
+            self.assertIn(token, source)
+        self.assertIn('data-main-tab="attention"', (WEB / "index.html").read_text())
+        for token in ('.forge-attention-list', '.policy-enforce', '.policy-advisory', '.policy-off'):
+            self.assertIn(token, (WEB / "app.css").read_text())
+
+    @unittest.skipUnless(shutil.which('node'), 'node is required for JavaScript probes')
+    def test_policy_chips_distinguish_applied_advisory_and_human_decisions(self):
+        source = (WEB / 'forge.js').read_text()
+        helpers = source[source.index('function jobPolicyChips'):source.index('function showTab')]
+        probe = r"""
+const esc = value => String(value).replaceAll('<', '&lt;');
+HELPERS
+const applied = {actor: 'policy', applied: true, action: 'submit'};
+let html = jobPolicyChips({policy: {mode: 'enforce', review: applied, bake: {...applied, action: 'approve'}}});
+if (!html.includes('auto-staged') || !html.includes('auto-approved') || html.includes('advisory:')) throw Error('Lost applied decisions');
+html = jobPolicyChips({policy: {mode: 'advisory', review: {...applied, applied: false}}, attention: {reason: '<review>'}});
+if (!html.includes('advisory: submit') || !html.includes('escalated: &lt;review>') || html.includes('auto-staged')) throw Error('Advisory or escaping regression');
+if (jobPolicyChips({policy: {review: {...applied, actor: 'human'}}}).includes('auto-staged')) throw Error('Human decision called automatic');
+if (jobPolicyChips({}) !== '') throw Error('Invented off-mode decision');
+const accepted = {accepted: true, policy: {...applied, action: 'accept'}};
+if (versionPolicyText(accepted) !== 'accepted by policy') throw Error('Missing acceptance');
+if (versionPolicyText({...accepted, attention: {reason: 'critic', detail: ['new failure']}}) !== 'flagged: new failure') throw Error('Historical acceptance hid fresh flag');
+if (versionPolicyText({policy: {action: 'flag', reasons: ['critic failed']}}) !== 'flagged: critic failed') throw Error('Dismissal erased policy history');
+if (versionPolicyText({...accepted, accepted: false}) !== 'no policy decision') throw Error('Unstar still displayed as accepted');
+console.log('Policy decision probe passed');
+""".replace('HELPERS', helpers)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'policy.log'
+            with output.open('w') as log:
+                result = subprocess.run(['node', '--input-type=module'], input=probe, text=True,
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=15)
+            self.assertEqual(result.returncode, 0, output.read_text())
+
+    @unittest.skipUnless(shutil.which('node'), 'node is required for JavaScript probes')
+    def test_attention_serializes_reads_and_refreshes_after_override(self):
+        source = (WEB / 'forge.js').read_text()
+        klass = source[source.index('class AttentionView'):source.index('class LibraryView')]
+        probe = r"""
+const fields = new Map();
+const $ = selector => { if (!fields.has(selector)) fields.set(selector, {hidden: true, replaceChildren() {}, append() {}}); return fields.get(selector); };
+const forge = '/v1/forge', encode = encodeURIComponent;
+const json = body => ({method: 'POST', body: JSON.stringify(body)});
+const toast = () => {}, policyAuthorField = () => '', bindPolicyAuthor = () => {};
+const esc = value => String(value).replaceAll('<', '&lt;');
+const button = (label, action) => `<button data-action="${action}">${label}</button>`;
+const guard = fn => fn;
+let policyAuthor = ' inspector ';
+const rendered = [];
+const document = {createElement: () => ({dataset: {}, querySelectorAll: () => []})};
+$('.forge-attention-list').append = card => rendered.push(card);
+$('.forge-attention-list').replaceChildren = () => { rendered.length = 0; };
+const board = {card: job => { if (job.id !== 'job1') throw Error('Wrong job'); }};
+const detail = {root: {hidden: true, querySelectorAll: () => []}};
+const library = {refresh: () => { throw Error('Hidden library refreshed'); }};
+const calls = []; let resolveRead, active = 0, peak = 0;
+const api = async (path, options) => {
+  calls.push([path, options]);
+  if (options) return {id: 'job1'};
+  active++; peak = Math.max(peak, active);
+  const data = await new Promise(resolve => { resolveRead = resolve; });
+  active--; return data;
+};
+CLASS
+const view = new AttentionView({querySelectorAll: () => []});
+const first = view.refresh();
+if (view.refresh() !== first || calls.length !== 1) throw Error('Overlapping attention reads');
+const attention = {reason: 'critic', detail: ['<failed>'], at: '2026-09-07T00:00:00Z'};
+resolveRead({jobs: [{id: 'job1', asset: 'a', variant: 'v', state: 'ready', attention}],
+  versions: [{job_id: 'job1', number: 2, asset: 'a', variant: 'v', state: 'ready', attention}]});
+await first;
+if ($('#attentionCount').textContent !== '2' || rendered.length !== 2) throw Error('Wrong attention card count');
+if (!rendered[0].innerHTML.includes('&lt;failed>') || !rendered[1].innerHTML.includes('Override: accept')) throw Error('Missing escaped details or version action');
+const stale = view.refresh();
+const overridden = view.override('job1', 'dismiss');
+await Promise.resolve();
+await view.override('job1', 'dismiss');
+if (calls.filter(([, options]) => options).length !== 1) throw Error('Duplicate override submitted');
+const posted = calls.find(([, options]) => options);
+if (posted[0] !== '/v1/forge/jobs/job1/policy/override' || posted[1].body !== '{"action":"dismiss","author":"inspector"}') throw Error('Wrong audited payload');
+resolveRead({jobs: [], versions: []});
+await stale;
+// Yield the promise chain after draining the read that preceded the write.
+await new Promise(resolve => setImmediate(resolve));
+if (calls.filter(([, options]) => !options).length !== 3) throw Error('No fresh read after override');
+resolveRead({jobs: [], versions: []});
+await overridden;
+if (peak !== 1 || $('#attentionCount').textContent !== '0') throw Error('Stale badge or overlapping reads');
+policyAuthor = ' ';
+let rejected = false;
+try { await view.override('job1', 'accept'); } catch { rejected = true; }
+if (!rejected || calls.filter(([, options]) => options).length !== 1) throw Error('Blank author reached API');
+console.log('Attention serialization probe passed');
+""".replace('CLASS', klass)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'attention.log'
+            with output.open('w') as log:
+                result = subprocess.run(['node', '--input-type=module'], input=probe, text=True,
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=15)
+            self.assertEqual(result.returncode, 0, output.read_text())
+
+    @unittest.skipUnless(shutil.which('node'), 'node is required for JavaScript probes')
+    def test_library_policy_default_waits_once_and_preserves_user_choice(self):
+        source = (WEB / 'forge.js').read_text()
+        klass = source[source.index('class LibraryView'):source.index('class VersionDetail')]
+        probe = r"""
+let fields, resolvePolicy;
+const $ = selector => fields[selector];
+const button = () => '', guard = fn => fn, toast = () => {};
+const forge = '/v1/forge';
+const readPolicy = () => new Promise(resolve => { resolvePolicy = resolve; });
+const paths = [];
+const api = async path => { paths.push(path); return []; };
+CLASS
+for (const mode of ['enforce', 'advisory', 'off']) {
+  fields = {'#libraryQuery': {value: ''}, '#libraryOrigin': {value: ''}, '#libraryAccepted': {checked: false},
+    '[data-action=refresh]': {}, '#libraryGrid': {replaceChildren() {}}};
+  const library = new LibraryView({});
+  const before = paths.length;
+  const loading = library.refresh();
+  if (paths.length !== before) throw Error('Queried before policy default');
+  resolvePolicy({mode}); await loading;
+  if (paths.at(-1).includes('accepted=true') !== (mode === 'enforce')) throw Error('Wrong default');
+  fields['#libraryAccepted'].checked = false;
+  await fields['#libraryAccepted'].onchange();
+  if (paths.at(-1).includes('accepted=true')) throw Error('User filter reset');
+}
+const library = new LibraryView({});
+fields['#libraryAccepted'].checked = false;
+const changed = fields['#libraryAccepted'].onchange();
+resolvePolicy({mode: 'enforce'}); await changed;
+if (fields['#libraryAccepted'].checked) throw Error('Slow policy overwrote user choice');
+console.log('Library policy default probe passed');
+""".replace('CLASS', klass)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'library-policy.log'
+            with output.open('w') as log:
+                result = subprocess.run(['node', '--input-type=module'], input=probe, text=True,
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=15)
+            self.assertEqual(result.returncode, 0, output.read_text())
 
     def test_javascript_module_syntax(self):
         self.assertIsNotNone(shutil.which("node"), "Node is required for the static JS syntax gate.")

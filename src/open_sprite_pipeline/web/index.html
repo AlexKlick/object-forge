@@ -35,6 +35,7 @@
       <button type="button" role="tab" data-main-tab="capture" aria-selected="true" aria-controls="capturePanel">Capture</button>
       <button type="button" role="tab" data-main-tab="forge" aria-selected="false" aria-controls="forgePanel">Bake Forge</button>
       <button type="button" role="tab" data-main-tab="library" aria-selected="false" aria-controls="libraryWorkspace">Library</button>
+      <button type="button" role="tab" data-main-tab="attention" aria-selected="false" aria-controls="attentionPanel">Attention <span id="attentionCount" class="forge-badge" aria-live="polite">…</span></button>
     </nav>
     <main class="shell">
       <div id="capturePanel" data-main-panel="capture" role="tabpanel">
@@ -182,6 +183,7 @@
         <div id="libraryPanel"></div>
         <section id="versionDetail" class="forge-surface" hidden></section>
       </section>
+      <section id="attentionPanel" data-main-panel="attention" role="tabpanel" hidden></section>
     </main>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

@@ -69,7 +69,7 @@ a changed catalog before the next bake, then reopen the Forge tab.
 
 U1 runs policy decisions in the API-owned store at match publication, staging
 completion, and critic completion. The worker still needs a submitted review to
-stage and an approved queue entry to bake. No UI changes are required. Configure
+stage and an approved queue entry to bake. Configure
 policy on the server; the host worker does not own these decisions.
 
 `FORGE_POLICY=off` preserves manual operation and writes no automatic policy
@@ -128,6 +128,17 @@ Retries with the same completion lease and evidence return the existing result
 without submitting twice or duplicating audit records. Different evidence or an
 unrelated lease is refused. The pure bake helper returns its action string; the
 store attaches the full threshold snapshot to its audit record.
+
+**In the UI:** The Forge status line shows the policy mode; hover over its chip
+for thresholds. The Attention tab counts and lists jobs and flagged versions,
+with reasons and timestamps, refreshed with the job poll about every ten seconds.
+Review opens the job's match review; Open shows version detail. Job cards show
+`auto-staged`, `auto-approved`, escalation reasons, and advisory recommendations;
+library cards mark flagged versions and detail shows the policy decision.
+Override buttons submit, approve, accept, or dismiss through the audited policy
+route using the override author (default `owner`, saved in localStorage). Dismiss
+clears attention without accepting or advancing work. In enforce mode, Library
+starts with Accepted only checked; the filter remains editable.
 
 Repository tests use fake style and critic responses. Operator zero-click rounds
 remain necessary for live acceptance, including real style, bake, critic, and
