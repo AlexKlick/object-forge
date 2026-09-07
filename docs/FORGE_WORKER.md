@@ -212,8 +212,13 @@ an unsubmitted human review even if all candidates fail their checks.
 On submit, staging copies the full-frame PNG unchanged, preserving render alpha.
 Candidates can only stage to their original view. Job-owned style reports and
 chosen PNGs are restored before staging/baking and copied into version artifacts;
-`metrics.style` records, per view, the chosen seed with its `pass`, `palette_drift`,
-`change` (the "did styling happen" gate) and `detail_gain`, plus model, refs and tokens.
+`metrics.style` records, per view, the seed the submitted review accepted (`seed`,
+`staged: true`) — the bytes the bake consumed — alongside the worker's ranked pick
+(`auto_seed`), with that seed's `pass`, `palette_drift`, `change` (the "did styling
+happen" gate) and `detail_gain`, plus model, refs and tokens. A view whose review
+accepted no style candidate has `seed: null`, `staged: false` and no retained PNG.
+The retained `style/<view>/<seed>.png` artifact is always the accepted seed, never
+the ranking (a human "Use this seed" in review is honoured end to end).
 `STYLE`, `STYLE-TRUNCATED`, and GPU-busy deferred markers are retained in the log.
 Missing depth, an unconfigured requested style engine, or a variant with no
 `short`/`descriptions` prompt entry (and no `prompt_override`) fails with a clear error

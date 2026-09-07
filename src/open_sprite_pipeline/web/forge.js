@@ -379,8 +379,8 @@ class BlockoutReview {
       <ul class="blockout-assumptions">${blockout.assumptions.map((text) => `<li>${esc(text)}</li>`).join("")}</ul>
       <p class="blockout-next-view">Suggested next view: ${esc(blockout.next_view)}</p>
       <fieldset id="${id}-regenerate" ${job.match.submitted ? "disabled" : ""}><legend>Regenerate blockout (${job.generate.regenerations}/8)</legend>
-        <div class="forge-fields"><label>Height hint (m)<input class="text-control blockout-height" type="number" min="1" max="300" step="any" value="${esc(job.generate.height_hint)}"></label>
-        <label>Floor height (m)<input class="text-control blockout-floor" type="number" min="1" max="10" step="any" value="${esc(job.generate.floor_height)}"></label>
+        <div class="forge-fields"><label>Height hint (m)<input class="text-control blockout-height" type="number" min="1" max="300" step="any" value="${esc(job.generate.height_hint ?? "")}"></label>
+        <label>Floor height (m)<input class="text-control blockout-floor" type="number" min="1" max="10" step="any" value="${esc(job.generate.floor_height ?? "")}"></label>
         <label>Tower override<select class="select-control blockout-tower"><option value="keep">Keep inferred tower</option><option value="none">No tower</option></select></label></div>
         <div class="blockout-palette-inputs forge-fields"></div>${button("Regenerate", "regenerate", "primary")}</fieldset>`;
     for (const [role, color] of Object.entries(blockout.palette)) {

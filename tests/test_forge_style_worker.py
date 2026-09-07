@@ -207,14 +207,49 @@ class StyleWorkerTests(unittest.TestCase):
         self.assertEqual(version['metrics']['style']['model'], 'fake-style')
         self.assertEqual(version['metrics']['style']['refs'], 1)
         for view, summary in version['metrics']['style']['views'].items():
-            self.assertEqual(set(summary), {'seed', 'pass', 'palette_drift', 'change', 'detail_gain'})
-            self.assertEqual(summary['seed'], report['views'][view]['chosen'])
+            self.assertEqual(set(summary), {'seed', 'auto_seed', 'staged', 'pass', 'palette_drift', 'change', 'detail_gain'})
+            self.assertEqual((summary['seed'], summary['auto_seed'], summary['staged']),
+                             (report['views'][view]['chosen'], report['views'][view]['chosen'], True))
             self.assertTrue(summary['pass'])
             self.assertGreaterEqual(summary['change'], 4.0)
         self.assertTrue(any(line.startswith('STYLE front') and ' change=' in line and ' pass=True' in line
                             for line in job['worker_log']))
         for name, data in original.items():
             self.assertEqual(self.store.artifact_file('a', 'v', version['number'], name).read_bytes(), data)
+
+    def test_human_seed_choice_drives_staging_and_version_custody(self):
+        # SE3 live round defect: the version retained the worker's ranked seed
+        # although the review accepted (and the bake consumed) another one.
+        self.create(style={'enabled': True, 'seeds_per_view': 2})
+        job = self.worker.run_next()
+        self.assertEqual(job['state'], 'review')
+        report = self.store.get_style_report(job['id'])
+        view, other = job['canonical_views'][0], job['canonical_views'][1]
+        auto = report['views'][view]['chosen']
+        alternate = next(seed for seed in report['views'][view]['seeds'] if seed != auto)
+        panels = []
+        for p in job['match']['panels']:
+            decision = p['decision']
+            if p['style_view'] == view:
+                decision = 'accept' if p['seed'] == alternate else 'reject'
+            panels.append({'panel_id': p['panel_id'], 'decision': decision, 'view': p['view']})
+        self.client.request('POST', f"/jobs/{job['id']}/review", {'mode': 'submit', 'panels': panels, 'views_missing': []})
+        staged = self.worker.run_next()
+        self.assertEqual(staged['state'], 'staged')
+        alt_bytes = self.store.style_candidate_file(job['id'], view, alternate).read_bytes()
+        self.assertEqual(self.store.staged_view_file(job['id'], view).read_bytes(), alt_bytes)
+        ws = self.worker.workspace_root(job)
+        (ws / f'style/{view}/{alternate}.png').write_bytes(b'other job overwrote workspace')
+        version = self.bake(staged)
+        self.assertIn(f'style/{view}/{alternate}.png', version['artifacts'])
+        self.assertNotIn(f'style/{view}/{auto}.png', version['artifacts'])
+        self.assertEqual(self.store.artifact_file('a', 'v', version['number'], f'style/{view}/{alternate}.png').read_bytes(), alt_bytes)
+        summary = version['metrics']['style']['views'][view]
+        self.assertEqual((summary['seed'], summary['auto_seed'], summary['staged']), (alternate, auto, True))
+        self.assertEqual(summary['palette_drift'], report['views'][view]['metrics'][str(alternate)]['metrics']['palette_drift'])
+        self.assertEqual(summary['pass'], report['views'][view]['metrics'][str(alternate)]['metrics']['pass'])
+        untouched = version['metrics']['style']['views'][other]
+        self.assertEqual((untouched['seed'], untouched['auto_seed']), (report['views'][other]['chosen'],) * 2)
 
     def test_photo_style_depth_copy_busy_retry_and_overrides(self):
         self.fake.busy = 2

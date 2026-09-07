@@ -718,6 +718,24 @@ class ForgeWorker:
         job["style"] = saved["style"]
         return result
 
+    @staticmethod
+    def staged_style_seeds(job: dict) -> dict:
+        """View -> seed of the style candidate the submitted review accepted.
+
+        The style report's `chosen` is the worker's metric ranking; a human may
+        pick another seed in review (SE3 "Use this seed"). Staging already
+        honours the decision, so version custody must follow the decision too,
+        never the ranking. Views whose review accepted no style candidate
+        (photo panel or missing view) are absent from the result.
+        """
+        panels = {p["panel_id"]: p for p in job.get("match", {}).get("panels", []) if "style_view" in p}
+        seeds = {}
+        for decision in job.get("match", {}).get("decisions", []):
+            panel = panels.get(decision.get("panel_id"))
+            if panel is not None and decision.get("decision") != "reject":
+                seeds[decision.get("view") or panel["style_view"]] = panel["seed"]
+        return seeds
+
     def restore_workspace(self, job: dict, *, staged=False):
         # Another job for this pair may have used the shared workspace while the
         # operator reviewed this one. Restore this job's API-owned bytes first.
@@ -734,11 +752,12 @@ class ForgeWorker:
         if job.get("style"):
             report = self.client.request("GET", base + "/style")
             checked_path(ws, "style/report.json").write_text(json.dumps(report, allow_nan=False, indent=2))
+            staged_seeds = self.staged_style_seeds(job)
             for view, entry in report["views"].items():
-                seed = entry["chosen"]
-                path = checked_path(ws, f"style/{view}/{seed}.png")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(self.client.request("GET", base + f"/style/{view}/{seed}.png"))
+                for seed in {entry["chosen"], staged_seeds.get(view, entry["chosen"])}:
+                    path = checked_path(ws, f"style/{view}/{seed}.png")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(self.client.request("GET", base + f"/style/{view}/{seed}.png"))
         if staged:
             self.copy_workspace_views(job)
         return ws
@@ -954,15 +973,22 @@ class ForgeWorker:
             metrics["synth"] = {"confidence": blockout["confidence"], "params": blockout["params"]}
             if job.get("style"):
                 report = json.loads(checked_path(target, "style/report.json").read_bytes())
-                names = ["style/report.json"] + [f"style/{view}/{entry['chosen']}.png"
-                                                for view, entry in report["views"].items()]
+                # Custody follows the submitted review: the retained PNG and the
+                # per-view seed are what the bake actually consumed, while
+                # auto_seed keeps the worker's ranking for the record.
+                staged_seeds = self.staged_style_seeds(job)
+                names = ["style/report.json"] + [f"style/{view}/{staged_seeds[view]}.png"
+                                                for view in report["views"] if view in staged_seeds]
                 for name in names:
                     artifacts[name] = {"encoding": "base64", "data": base64.b64encode(
                         checked_path(target, name).read_bytes()).decode("ascii")}
-                metrics["style"] = {"views": {view: {"seed": entry["chosen"], **{
-                    key: entry["metrics"][str(entry["chosen"])]["metrics"][key]
-                    for key in ("pass", "palette_drift", "change", "detail_gain")}} for view, entry in report["views"].items()},
-                    **{key: report[key] for key in ("model", "refs", "prompt_tokens")}}
+                views = {}
+                for view, entry in report["views"].items():
+                    seed = staged_seeds.get(view)
+                    scored = entry["metrics"][str(seed if seed is not None else entry["chosen"])]["metrics"]
+                    views[view] = {"seed": seed, "auto_seed": entry["chosen"], "staged": seed is not None,
+                                   **{key: scored[key] for key in ("pass", "palette_drift", "change", "detail_gain")}}
+                metrics["style"] = {"views": views, **{key: report[key] for key in ("model", "refs", "prompt_tokens")}}
         return artifacts, metrics
 
     def progress(self, job: dict, *markers: str, **fields):

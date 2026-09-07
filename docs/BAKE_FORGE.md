@@ -317,7 +317,9 @@ Palette-only jobs cannot style. The loopback sidecar consumes renders, their
 metrics are retained; the chosen seed defaults to accepted for its canonical
 view, with other seeds marked alternate. Human review remains required. Staging
 copies the candidate PNG unchanged, and bake artifacts retain `style/report.json`
-and each chosen PNG with `metrics.style`. The worker restores those job-owned
+and, per view, the PNG of the seed the review accepted (which may differ from the
+worker's ranked `chosen`; `metrics.style` carries both as `seed` and `auto_seed`).
+The worker restores those job-owned
 bytes before staging and baking when another job has used the shared workspace.
 See [FORGE_WORKER.md](FORGE_WORKER.md) for report shape, routes, seed ordering,
 metric scaling and retry behavior; [STYLE_ENGINE.md](STYLE_ENGINE.md) describes
