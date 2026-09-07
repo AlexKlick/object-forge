@@ -147,6 +147,10 @@ Success requires driver rc=0, a fresh log containing `BAKE `, and fresh required
 artifacts (inode/size/mtime/ctime must differ from pre-run observations). Harvest
 includes the named GLB, atlas, both JSON reports, blender.log and the requested
 `turntable/tt_XX.png` frames. Old frames outside the requested count are excluded.
+
+- `<asset>_<variant>_lod.glb`: optional; must be fresh and pass the GLB export gate when present, with results in `metrics.glb_lod` (null and a `LOD absent` marker when absent).
+- `blockout/build_plan.json`: required for generate-family versions; retained from the workspace bake alongside `blockout/spec.yaml`.
+
 P1 completion accepts at most 64 artifacts, 64 MiB total and 32 MiB per artifact;
 the prior 8 MiB total limit was smaller than megabank's GLB/atlas/eight frames.
 Harvested JSON is validated while retaining its exact source bytes, like binary

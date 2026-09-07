@@ -150,7 +150,11 @@ class GenerateWorkerTests(unittest.TestCase):
         self.client.request('POST', f"/jobs/{job['id']}/approve")
         ready = self.worker.run_next()
         self.assertEqual(ready['state'], 'ready')
-        return self.store.get_version('a', 'v', ready['version_number'])
+        version = self.store.get_version('a', 'v', ready['version_number'])
+        self.assertIn('blockout/build_plan.json', version['artifacts'])
+        self.assertEqual(self.store.artifact_file('a', 'v', ready['version_number'],
+                         'blockout/build_plan.json').read_bytes(), b'{"regenerated": true}')
+        return version
 
     def edit_child(self, parent, edit, **fields):
         response = self.http.post('/v1/forge/jobs', data={'asset': 'a', 'variant': 'v',
@@ -311,11 +315,25 @@ class GenerateWorkerTests(unittest.TestCase):
         self.assertEqual(version['origin'], 'bake')
         self.assertIn('blockout/spec.yaml', version['artifacts'])
         self.assertEqual(self.store.artifact_file('a', 'v', 1, 'blockout/spec.yaml').read_bytes(), self.store.blockout_file(job['id'], 'spec.yaml').read_bytes())
+        self.assertIn('blockout/build_plan.json', version['artifacts'])
+        self.assertEqual(self.store.artifact_file('a', 'v', 1, 'blockout/build_plan.json').read_bytes(),
+                         (ws / 'blockouts/a/v/build_plan.json').read_bytes())
         self.assertEqual(version['metrics']['synth'], {k: job['generate']['blockout'][k] for k in ('confidence', 'params')})
         self.assertTrue(version['metrics']['glb']['textured'])
         self.assertFalse(list(self.store.root.rglob('snapshot.json')))
         self.assertTrue((self.store.root / 'locks/a__v.workspace.lock').is_file())
         self.assertFalse((self.store.root / 'locks/a__v.lock').exists())
+
+    def test_missing_build_plan_fails_without_publishing_a_version(self):
+        job = self.stage(self.reviewing())
+        self.client.request('POST', f"/jobs/{job['id']}/approve")
+        bake = self.root / 'fake bake.py'
+        bake.write_text(bake.read_text().replace("plan.write_text('{\"regenerated\": true}')", 'pass'))
+        with self.assertRaisesRegex(ValueError, 'Missing generate-family build plan: .*build_plan.json'):
+            self.worker.run_next()
+        self.assertEqual(self.store.get_job(job['id'])['state'], 'failed')
+        self.assertIsNone(self.store.get_job(job['id']).get('version_number'))
+        self.assertEqual(self.store.list_versions(), [])
 
     def test_regeneration_reruns_synth_changes_spec_and_resets_decisions(self):
         job = self.reviewing()

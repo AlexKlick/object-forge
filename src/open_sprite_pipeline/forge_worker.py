@@ -638,6 +638,11 @@ class ForgeWorker:
             raise ValueError(f"Bake failed: rc={process.returncode}; fresh BAKE marker={'BAKE ' in seen}")
         names = [f"{job['asset']}_{job['variant']}.glb", "atlas.png", "bake_report.json",
                  "harmonize_report.json", "blender.log"]
+        lod = f"{job['asset']}_{job['variant']}_lod.glb"
+        if checked_path(target, output.relative_to(target) / lod).exists():
+            names.append(lod)
+        else:
+            self.progress(job, f"LOD absent — bake tool emitted no {lod}")
         frames = []
         if job["params"]["turntable"]:
             frames = [f"turntable/tt_{i:02d}.png" for i in range(job["params"]["turntable"])]
@@ -681,9 +686,22 @@ class ForgeWorker:
         self.progress(job, f"GLB-CHECK ok textured={metrics['glb']['textured']} "
                            f"uv_sets={metrics['glb']['uv_sets']} "
                            f"alpha={','.join(metrics['glb']['alpha_modes']) or 'none'}")
+        metrics["glb_lod"] = None
+        if lod in raw:
+            metrics["glb_lod"] = forge_glb.inspect(raw[lod], raw.get("atlas.png"))
+            unusable = forge_glb.violations(metrics["glb_lod"])
+            if unusable:
+                raise ValueError(f"Exported LOD GLB is unusable: {'; '.join(unusable)}")
+            self.progress(job, f"GLB-LOD-CHECK ok textured={metrics['glb_lod']['textured']} "
+                               f"uv_sets={metrics['glb_lod']['uv_sets']} "
+                               f"alpha={','.join(metrics['glb_lod']['alpha_modes']) or 'none'}")
         if self.generate_family(job):
             data = checked_path(target, f"specs/{job['asset']}.yaml").read_bytes()
             artifacts["blockout/spec.yaml"] = {"encoding": "base64", "data": base64.b64encode(data).decode("ascii")}
+            plan = checked_path(target, f"blockouts/{job['asset']}/{job['variant']}/build_plan.json")
+            if not plan.is_file():
+                raise ValueError(f"Missing generate-family build plan: {plan}")
+            artifacts["blockout/build_plan.json"] = {"encoding": "base64", "data": base64.b64encode(plan.read_bytes()).decode("ascii")}
             blockout = job["generate"]["blockout"]
             metrics["synth"] = {"confidence": blockout["confidence"], "params": blockout["params"]}
         return artifacts, metrics

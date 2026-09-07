@@ -82,6 +82,8 @@ shapes = {"glb_blend": {"alpha_mode": "BLEND"}, "glb_two_uv": {"uv_sets": 2},
           "glb_untextured": {"uv": (0.9, 0.9)}, "glb_no_uv": {"uv_sets": 0}}
 (out / "a_v.glb").write_bytes(
     b"not a gltf" if mode == "glb_corrupt" else glb(**shapes.get(mode, {})))
+if mode != "lod_absent":
+    (out / "a_v_lod.glb").write_bytes(glb(alpha_mode="BLEND") if mode == "lod_blend" else glb())
 if mode != "stale_atlas":
     # Opaque only in the top-left quadrant, so a UV can miss it on purpose.
     atlas = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
@@ -260,7 +262,8 @@ class ForgeBakeTests(unittest.TestCase):
             "coverage": {"front": 0.8, "palette": 0.2}, "bleed_avoided": 2, "bleed_faces": 0,
             "fallback_split": {"underside": 0.1, "gap": 0.1}, "harmonize_drift": {"front": 0.03},
             "turntable_frames": 1, "selfcheck": {"threshold": 0.97, "views": {"front": 0.99}},
-            "glb": {"parsed": True, "alpha_modes": ["OPAQUE"], "uv_sets": 1, "textured": 1.0}})
+            "glb": {"parsed": True, "alpha_modes": ["OPAQUE"], "uv_sets": 1, "textured": 1.0},
+            "glb_lod": {"parsed": True, "alpha_modes": ["OPAQUE"], "uv_sets": 1, "textured": 1.0}})
         for path in self.output.rglob("*"):
             if path.is_file():
                 stored = self.store.artifact_file("a", "v", 1, path.relative_to(self.output).as_posix())
@@ -272,6 +275,61 @@ class ForgeBakeTests(unittest.TestCase):
         next_job = self.approve(self.staged())
         self.worker.run_next()
         self.assertEqual(self.store.get_job(next_job["id"])["version_number"], 2)
+
+    def test_lod_is_published_with_metrics_and_check_marker(self):
+        job = self.approve(self.staged())
+        self.assertEqual(self.worker.run_next()["state"], "ready")
+        version = self.store.get_version("a", "v", 1)
+        self.assertIn("a_v_lod.glb", version["artifacts"])
+        self.assertEqual(self.store.artifact_file("a", "v", 1, "a_v_lod.glb").read_bytes(),
+                         (self.output / "a_v_lod.glb").read_bytes())
+        self.assertEqual(version["metrics"]["glb_lod"], {
+            "parsed": True, "alpha_modes": ["OPAQUE"], "uv_sets": 1, "textured": 1.0})
+        record = self.client.request("GET", f"/jobs/{job['id']}")
+        self.assertTrue(any("GLB-LOD-CHECK ok textured=1.0 uv_sets=1 alpha=OPAQUE" in line
+                            for line in record["worker_log"]))
+        self.assert_restored(job)
+
+    def test_unusable_lod_fails_without_consuming_a_version(self):
+        self.mode("lod_blend")
+        job = self.approve(self.staged())
+        with self.assertRaisesRegex(ValueError, "Exported LOD GLB is unusable: .*alphaMode BLEND"):
+            self.worker.run_next()
+        record = self.client.request("GET", f"/jobs/{job['id']}")
+        self.assertEqual(record["state"], "failed")
+        self.assertIsNone(record.get("version_number"))
+        self.assertEqual(self.store.list_versions(), [])
+        self.assertTrue(any("Exported LOD GLB is unusable" in line for line in record["worker_log"]))
+        self.assert_restored(job)
+        self.mode("ok")
+        self.approve(self.staged())
+        self.assertEqual(self.worker.run_next()["version_number"], 1)
+
+    def test_absent_lod_succeeds_with_null_metrics_and_marker(self):
+        self.mode("lod_absent")
+        job = self.approve(self.staged())
+        self.assertEqual(self.worker.run_next()["state"], "ready")
+        version = self.store.get_version("a", "v", 1)
+        self.assertNotIn("a_v_lod.glb", version["artifacts"])
+        self.assertIsNone(version["metrics"]["glb_lod"])
+        record = self.client.request("GET", f"/jobs/{job['id']}")
+        self.assertTrue(any("LOD absent — bake tool emitted no a_v_lod.glb" in line
+                            for line in record["worker_log"]))
+        self.assert_restored(job)
+
+    def test_present_stale_lod_fails_instead_of_being_skipped(self):
+        self.approve(self.staged())
+        self.worker.run_next()
+        previous_lod = (self.output / "a_v_lod.glb").read_bytes()
+        self.mode("lod_absent")
+        job = self.approve(self.staged())
+        with self.assertRaisesRegex(ValueError, "Missing or stale bake artifact: a_v_lod.glb"):
+            self.worker.run_next()
+        self.assertEqual(self.store.get_job(job["id"])["state"], "failed")
+        self.assertIsNone(self.store.get_job(job["id"]).get("version_number"))
+        self.assertEqual(len(self.store.list_versions()), 1)
+        self.assertEqual((self.output / "a_v_lod.glb").read_bytes(), previous_lod)
+        self.assert_restored(job)
 
     def test_unusable_glb_fails_the_job_instead_of_publishing_a_version(self):
         """Every other bake metric is measured inside Blender, so a mesh that

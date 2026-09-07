@@ -253,6 +253,9 @@ The GLB validation gate still applies. Completed generate-family versions use
 `origin=bake`, retain `blockout/spec.yaml`, and expose synthesis geometry and
 confidence under `metrics.synth`.
 
+- `<asset>_<variant>_lod.glb`: optional bake artifact; must be fresh and pass the GLB export gate when present, with results in `metrics.glb_lod` (null and a `LOD absent` marker when absent).
+- `blockout/build_plan.json`: required generate-family artifact, retained from the workspace bake alongside `blockout/spec.yaml`.
+
 ## Gen Ladder: iterate a blockout (GL5)
 
 Use **Edit blockout** on a version with `blockout/spec.yaml`. API creation is
