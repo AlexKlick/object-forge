@@ -37,6 +37,10 @@ services:
       OPEN_SPRITE_GPU_QUEUE_LIMIT: "8"
       HF_HOME: /cache/huggingface
       HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      # uid-1000 fix: Triton's cache defaults to $HOME/.triton and HOME=/ in
+      # this image — /.triton is not writable, which broke every real
+      # TRELLIS.2 run after the container stopped running as root.
+      TRITON_HOME: /cache/triton
       HF_TOKEN: ${HF_TOKEN:-}
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       OPENCV_IO_ENABLE_OPENEXR: "1"
