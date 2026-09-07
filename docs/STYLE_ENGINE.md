@@ -227,6 +227,29 @@ diffusers 0.40 removed the pipeline-level VAE slicing wrappers, and attention
 slicing discarded the IP-Adapter attention processors. Each surfaced only under
 a real model — the unit suite cannot see them; keep the smoke in every deploy.
 
+## Measured on the first full Forge round (SE2, 2026-09-07)
+
+`from_spec bank_citadel/megabank` with `style.enabled`, one mechanical reference
+(the SE0-B `styling_ref` render), default settings (3 seeds per view, 28 steps,
+`long_side=768`), seven spec views, host worker → sidecar → review → bake:
+
+| measurement | value |
+| --- | --- |
+| blockout render, 7 views + depth passes (Blender on the host) | ~50 s |
+| style step, 7 views × 3 seeds (sidecar warm after the first view) | ~7 min, ≈60 s per view |
+| prompt (pack `short:` + tags + palette roles + view) | 67–68 CLIP tokens, never truncated |
+| GPU 1 device peak (1 s sampling) with the 6.7 GB control lane resident | 10 885 MiB of 12 288 |
+| review | 21 `source:"style"` panels, all `metrics.pass` and `checks.pass`; palette_drift 3.6–7.0, change 5.3–9.7 |
+| chosen candidates vs renders | alpha byte-identical; mean RGB change inside the silhouette ≈16.6 levels |
+| bake of the seven staged candidates | ≤30 s; `GLB-CHECK ok` and `GLB-LOD-CHECK ok` (textured 1.0, 1 UV set, OPAQUE) |
+| version artifacts | `style/report.json` + one chosen PNG per view, both GLBs, `blockout/{spec.yaml,build_plan.json}` |
+| critic (Qwen3.5-4B, loopback) | warn, 85/100 |
+
+The turntable frame of that version shows the painted window grid, facade detail
+and brass fixtures; the palette-only bakes before it were flat colour. Visual
+quality is still a first pass at a 400×768 working size with a stand-in reference:
+a real style board from the operator is the next input, not more parameters.
+
 ## Troubleshooting
 
 - `gpu_busy`: inspect status and GPU 1 free memory; wait for other work to release
