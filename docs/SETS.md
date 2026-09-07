@@ -1,9 +1,8 @@
-# Forge sets (Factory F1)
+# Forge sets (Factory F1–F2)
 
 A set stores one scene requirements manifest and its uploaded images, then fans
 out ordinary Forge child jobs. It uses the scene lane's `requires`, `bindings`,
-and `props` contract. Export to a Godot-loadable library root is F2; UI is F3.
-Neither is part of F1.
+and `props` contract. F2 exports versions to a Godot-loadable library root; Sets UI follows in F3.
 
 ```yaml
 scene: block                         # `set` alias; default name: set
@@ -134,3 +133,78 @@ acceptance count:
 
 These are repository/store facts, not live export or Godot acceptance. The
 operator launches `assets/sets/debt_city_core.yaml` for live proof.
+
+
+## Export
+
+`POST /v1/forge/sets/{id}/export` returns 202 and queues a host worker task.
+`GET /v1/forge/sets/{id}/export` reads its durable `export.json` record: status
+(`requested`, `running`, `done`, `failed`), request/start/finish timestamps,
+lease, relative `library_root`, result, error, and history. A live running lease
+makes another request return 409. Export leases last 300 seconds; reads/claims
+lazily return expired work to the requested queue. Claims choose the oldest
+request. A subsequent request resets the result and retains prior history.
+
+Each required pair selects its latest accepted version, or its latest version
+when none is accepted. Unaccepted choices are explicitly recorded as
+`accepted: false`. Selection is frozen in the worker claim. A pair with no
+version is an item with `status: skipped` and `reason: no version`. Other skips
+come unchanged from repo B's `asset_library.build_library`: missing GLB/report
+parts, BLEND materials, or multiple UV sets. Acceptance does not override these
+library checks. The export report's coverage describes advertised pairs, which
+can differ from the set's latest-version coverage.
+
+The host worker links artifacts (copies with metadata when linking is unavailable)
+from immutable version `artifacts/` directories into this store-relative root:
+
+```text
+sets/<id>/library_root/
+  bakes/<asset>/<variant>/<asset>_<variant>.glb
+  bakes/<asset>/<variant>/<asset>_<variant>_lod.glb  # optional
+  bakes/<asset>/<variant>/bake_report.json
+  blockouts/<asset>/<variant>/build_plan.json     # optional
+  library/asset_library.json
+  library/city_bindings.json
+  library/report.json
+```
+
+Missing required bake files are not invented; repo B skips those pairs. Its own
+`build_library(..., digest=True)` and `write_library` produce the inventory,
+`bindings_document` produces bindings, and `scene_report(..., applied=True)`
+produces items, coverage, status counts, unbound kinds and unplaced assets.
+The completion result retains items, coverage, status counts, repo B's skipped
+list, and library totals. The skipped list excludes pairs with no version;
+those appear in report items. `applied: true` means files were materialized,
+not that Godot verification ran.
+
+Every build starts in an empty `.pending-<uuid>` sibling. First publication uses
+`os.replace`; a re-export uses Linux `renameat2(RENAME_EXCHANGE)` through the
+standard library because `os.replace` cannot overwrite a nonempty directory.
+Readers see a complete old or new root, never a partially built tree. A per-set
+host lock serializes publication and cleanup; the worker checks lease ownership
+before publication. Failed owned attempts remove the root and pending output;
+crashed pending directories are removed when the next worker retries. Re-export
+never merges old output, so obsolete LODs and blockout plans disappear. Version
+artifacts are never moved or rewritten. Treat exported hardlinks as read-only.
+
+When done, the export GET adds absolute `host_paths` for `library_root`,
+`asset_library`, `city_bindings`, and `report`. The worker supplies its resolved
+`host_store_root` at completion, retained as metadata so a container API can
+return host-absolute paths without opening them. Direct store callers that omit
+this optional metadata use the API store root. File responses always read via
+the API's own mounted store root.
+`GET /v1/forge/sets/{id}/library/{name}` serves only `asset_library.json`,
+`city_bindings.json`, or `report.json`, and returns 404 until done. Set details
+include compact `export` status/finished time/coverage/root (null before the
+first request); list summaries include `export_status`.
+
+Godot resolves inventory GLB paths relative to the manifest's grandparent,
+`library_root`. No client changes or editor import are required. From repo B,
+the operator runs:
+
+```bash
+godot --headless --path apps/greybox --script res://tools/verify_library.gd -- --manifest=<library_root>/library/asset_library.json
+```
+
+Repository tests use real GLB fixture bytes and read-only repo B helpers.
+Live set export and Godot placement verification remain operator proof.

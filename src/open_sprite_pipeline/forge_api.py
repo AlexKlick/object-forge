@@ -13,6 +13,7 @@ import binascii
 import hmac
 import json
 import os
+from pathlib import Path
 import re
 from typing import Any, Literal
 
@@ -96,7 +97,7 @@ class Progress(Payload):
 
 
 class Claim(Payload):
-    kind: Literal["pipeline", "critic"] = "pipeline"
+    kind: Literal["pipeline", "critic", "export"] = "pipeline"
     stages: list[Literal["matching", "review", "baking"]] | None = None
     job_id: str | None = None
 
@@ -186,6 +187,48 @@ def launch_set(request: Request, set_id: str, body: SetLaunch | None = None):
 @forge_router.post("/sets/{set_id}/retry")
 def retry_set(request: Request, set_id: str):
     return store(request).retry_set(set_id)
+
+
+@forge_router.post("/sets/{set_id:path}/export", status_code=202)
+def request_export(request: Request, set_id: str):
+    return store(request).request_export(set_id)
+
+
+@forge_router.get("/sets/{set_id}/export")
+def get_export(request: Request, set_id: str):
+    forge = store(request)
+    record = forge.get_export(set_id)
+    if record["status"] == "done":
+        root = Path(record.get("host_store_root", str(forge.root))) / record["library_root"]
+        record["host_paths"] = {"library_root": str(root), **{
+            name: str(root / "library" / (name + ".json"))
+            for name in ("asset_library", "city_bindings", "report")}}
+    return record
+
+
+@forge_router.get("/sets/{set_id}/library/{name}")
+def set_library(request: Request, set_id: str, name: str):
+    return FileResponse(store(request).export_file(set_id, name), media_type="application/json")
+
+
+class ExportComplete(Lease):
+    result: dict[str, Any]
+    host_store_root: str | None = None
+
+
+class ExportFail(Lease):
+    error: str
+
+
+@forge_router.post("/worker/export/{set_id}/complete", dependencies=[Depends(worker_auth)])
+def complete_export(request: Request, set_id: str, body: ExportComplete):
+    return store(request).complete_export(set_id, lease_id=body.lease_id, result=body.result,
+                                          host_store_root=body.host_store_root)
+
+
+@forge_router.post("/worker/export/{set_id}/fail", dependencies=[Depends(worker_auth)])
+def fail_export(request: Request, set_id: str, body: ExportFail):
+    return store(request).fail_export(set_id, lease_id=body.lease_id, error=body.error)
 
 
 @forge_router.get("/sets/{set_id}/style/{n}")

@@ -4,6 +4,8 @@ Phase 6 prepares the checkout for deployment. Container rebuild/recreation,
 host worker execution, real Blender bakes, browser checks, and critic inference
 are operator gates; repository tests alone do not prove those lanes.
 
+Factory F2 adds the host-worker [set export lane](SETS.md#export); live export and Godot verification remain operator gates.
+
 ## Architecture
 
 - **State:** FastAPI runs in the `object-forge` container, exposed only at

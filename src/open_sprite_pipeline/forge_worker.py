@@ -10,6 +10,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from functools import partial
 import base64
+import ctypes
 import fcntl
 import hashlib
 from io import BytesIO
@@ -22,11 +23,13 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 from threading import Event, Thread
 import time
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -40,7 +43,7 @@ DEFAULT_SPIKE_ASSETS = Path("/home/alexk/debt-city-greybox-spike/apps/greybox/as
 BAKE_MARKERS = re.compile(r"\b(?:PROJECT|SELFCHECK|VIEW-VALIDATE|TURNTABLE|BAKE|VERIFY)\b")
 
 
-def checked_path(root: Path, relative: str | Path) -> Path:
+def checked_path(root: Path, relative: str | Path, *, allow_hardlinks: bool = False) -> Path:
     """Reject aliases before any transient write or artifact read."""
     path = root / relative
     if not path.is_relative_to(root) or ".." in path.parts:
@@ -50,9 +53,28 @@ def checked_path(root: Path, relative: str | Path) -> Path:
             break
         if component.is_symlink():
             raise ValueError(f"Symlink forbidden: {component}")
-    if path.is_file() and path.stat().st_nlink != 1:
+    if not allow_hardlinks and path.is_file() and path.stat().st_nlink != 1:
         raise ValueError(f"Hardlink forbidden: {path}")
     return path
+
+
+def publish_library_root(pending: Path, destination: Path):
+    """Publish a whole directory on the Linux host, including nonempty re-exports.
+
+    rename/replace cannot overwrite a nonempty directory. Linux's atomic exchange
+    keeps the previous complete root readable until the new complete root is in
+    place; the old tree then occupies pending and can be removed safely.
+    """
+    if not destination.exists():
+        os.replace(pending, destination)
+        return
+    renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    if renameat2(-100, os.fsencode(pending), -100, os.fsencode(destination), 2) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+    shutil.rmtree(pending)
 
 
 def fingerprint(path: Path):
@@ -104,12 +126,16 @@ class ForgeClient:
 
 
 def load_tool(assets: Path, name: str):
-    if name not in {"sheet_match", "blockout", "style_prompt", "style_metrics", "style_check", "style_compose"}:
+    if name not in {"sheet_match", "blockout", "style_prompt", "style_metrics", "style_check", "style_compose", "asset_library", "scene_build"}:
         raise ValueError("Unsupported spike helper.")
     # Keep disabled for the host process lifetime, including lazy helper imports.
     sys.dont_write_bytecode = True
     directory = str(assets.resolve() / "tools")
+    original_path = sys.path[:]
     sys.path.insert(0, directory)
+    dependency = sys.modules.get("asset_library")
+    if name == "scene_build":
+        sys.modules["asset_library"] = load_tool(assets, "asset_library")
     try:
         # An embedding caller may previously have loaded a different spike tree.
         previous = sys.modules.pop(name, None)
@@ -123,7 +149,11 @@ def load_tool(assets: Path, name: str):
             if previous is not None:
                 sys.modules[name] = previous
     finally:
-        sys.path.remove(directory)
+        sys.path[:] = original_path
+        if name == "scene_build":
+            sys.modules.pop("asset_library", None)
+            if dependency is not None:
+                sys.modules["asset_library"] = dependency
 
 
 def load_matcher(assets: Path):
@@ -357,6 +387,107 @@ class ForgeWorker:
             "lease_id": version["critic_lease"]["lease_id"], "verdict": verdict})
         print(f"CRITIC v{version['number']} " + json.dumps(result), flush=True)
         return result
+
+    def run_export_next(self):
+        claim = self.client.request("POST", "/worker/claim", {"kind": "export"})
+        if claim is None:
+            return None
+        set_id, lease_id = claim["set_id"], claim["export_lease"]["lease_id"]
+        endpoint = f"/worker/export/{set_id}"
+        pending = library_root = None
+        lock = None
+        owned = False
+
+        def check_lease():
+            record = self.client.request("GET", f"/sets/{set_id}/export")
+            if record["status"] != "running" or (record.get("lease") or {}).get("lease_id") != lease_id:
+                raise ValueError("Missing, stale or expired export lease.")
+
+        try:
+            # Validate payload identifiers before using them in filesystem paths.
+            from .forge_store import ForgeStore
+            ForgeStore._name(set_id)
+            root = self.store_root()
+            directory = checked_path(root, f"sets/{set_id}")
+            lock_path = checked_path(root, f"locks/export-{set_id}.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock = lock_path.open("a+b")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            check_lease()
+            owned = True
+            library_root = checked_path(root, directory / "library_root")
+            # Recover only export-owned pending directories after a crashed worker.
+            for stale in directory.glob(".pending-*"):
+                shutil.rmtree(checked_path(root, stale))
+            pending = checked_path(root, directory / f".pending-{uuid4().hex}")
+            pending.mkdir()
+            items, pairs = [], []
+            for key, pair in claim["pairs"].items():
+                asset, variant = key.split("/")
+                ForgeStore._name(asset)
+                ForgeStore._name(variant)
+                number = pair["version"]
+                item = {"asset": asset, "variant": variant, "version": number,
+                        "accepted": bool(pair["accepted"]), "status": "exported"}
+                items.append(item)
+                if number is None:
+                    item.update(status="skipped", reason="no version")
+                    continue
+                if type(number) is not int or number < 1:
+                    raise ValueError("Version number must be a positive integer.")
+                source_root = checked_path(root, f"assets/{asset}/variants/{variant}/versions/v{number}/artifacts")
+                names = {name: f"bakes/{asset}/{variant}/{name}" for name in
+                         (f"{asset}_{variant}.glb", f"{asset}_{variant}_lod.glb", "bake_report.json")}
+                names["blockout/build_plan.json"] = f"blockouts/{asset}/{variant}/build_plan.json"
+                for name, destination in names.items():
+                    source = checked_path(source_root, name, allow_hardlinks=True)
+                    if not source.is_file():
+                        continue  # Repo B owns missing-bake skip decisions.
+                    target = checked_path(pending, destination)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(source, target)
+                    except OSError:
+                        shutil.copy2(source, target)
+                pairs.append((asset, variant))
+            library_tool, scene = self.tool("asset_library"), self.tool("scene_build")
+            library = library_tool.build_library(pending, pairs, digest=True)
+            skipped = {(s["asset"], s["variant"]): s["reason"] for s in library["skipped"]}
+            for item in items:
+                reason = skipped.get((item["asset"], item["variant"]))
+                if reason is not None:
+                    item.update(status="skipped", reason=reason)
+            manifest = claim["manifest"]
+            report = scene.scene_report(manifest, items, library, scene.unbound_kinds(manifest, library), applied=True)
+            library_tool.write_library(library, checked_path(pending, "library/asset_library.json"))
+            for name, document in (("city_bindings", scene.bindings_document(manifest)), ("report", report)):
+                checked_path(pending, f"library/{name}.json").write_text(
+                    json.dumps(document, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+            result = {key: report[key] for key in ("items", "coverage", "status_counts")}
+            result.update(skipped=library["skipped"], totals=library["totals"])
+            check_lease()
+            publish_library_root(pending, library_root)
+            response = self.client.request("POST", endpoint + "/complete", {
+                "lease_id": lease_id, "result": result, "host_store_root": str(root)})
+            print(f"EXPORT set={set_id} pairs={len(items)} exported={library['totals']['variants']} "
+                  f"skipped={sum(i['status'] == 'skipped' for i in items)}", flush=True)
+            return response
+        except Exception as exc:
+            if pending is not None and pending.exists():
+                shutil.rmtree(pending)
+            # A reclaimed worker must never remove its successor's published tree.
+            if owned:
+                try:
+                    check_lease()
+                except Exception:
+                    owned = False
+            if owned and library_root is not None and library_root.exists():
+                shutil.rmtree(library_root)
+            print(f"EXPORT failed set={set_id}: {exc}", flush=True)
+            return self.client.request("POST", endpoint + "/fail", {"lease_id": lease_id, "error": str(exc)})
+        finally:
+            if lock is not None:
+                lock.close()
 
     def critic_loop(self, stopped: Event, interval: float):
         # Independent from run_next/process and their job-failure reporting path.
@@ -1239,7 +1370,10 @@ def main() -> int:
                     worker.run_critic_next()
                 except Exception as exc:
                     print(f"CRITIC storage unavailable: {type(exc).__name__}: {exc}", flush=True)
+                worker.run_export_next()
                 return 0
+            if result is None:
+                result = worker.run_export_next()
             if result is None:
                 time.sleep(interval)
         except Exception as exc:

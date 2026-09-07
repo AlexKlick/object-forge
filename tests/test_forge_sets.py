@@ -214,7 +214,13 @@ class SetApiTests(unittest.TestCase):
         self.assertEqual(self.http.get('/v1/forge/sets/' + item['id']).json(), item)
         self.assertEqual(self.http.get('/v1/forge/sets').json(), [{
             'id': item['id'], 'name': 'block', 'created_at': item['created_at'],
-            'requested_pairs': 1, 'coverage': {'percent': 0.0}, 'attention': 0}])
+            'requested_pairs': 1, 'coverage': {'percent': 0.0}, 'attention': 0, 'export_status': None}])
+        self.assertIsNone(item['export'])
+        self.store.request_export(item['id'])
+        self.assertEqual(self.store.get_set(item['id'])['export'], {
+            'status': 'requested', 'finished_at': None, 'coverage': None,
+            'library_root': f"sets/{item['id']}/library_root"})
+        self.assertEqual(self.store.list_sets()[0]['export_status'], 'requested')
 
     def test_fanout_plans_refs_sources_and_idempotence(self):
         item = self.create('''palette_only: true

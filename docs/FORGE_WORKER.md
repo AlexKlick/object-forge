@@ -406,3 +406,32 @@ The API writes `critic/critic.json` and a compact `version.json` critic summary
 whose `issues` field is a count. Library and version listings include that
 summary. The Critic tab shows the full issues, score, summary, failure excerpt,
 model and timestamp; it polls pending verdicts and provides a rerun button.
+
+
+## Set export lane (Factory F2)
+
+The worker claims `POST /v1/forge/worker/claim` with `{"kind": "export"}` and
+receives `{set_id, export_lease, manifest, pairs}`. The API selects versions;
+the host resolves `FORGE_STORE_ROOT` and materializes the [set library](SETS.md#export).
+The existing independent critic thread remains separate from pipeline work.
+Continuous workers try exports when the pipeline has no claim; one-shot workers
+run pipeline, then critic, then export. Export uses no model calls or UI changes.
+
+The worker imports repo B's `asset_library` and `scene_build` with bytecode writes
+disabled. All export writes stay in the Forge store. A per-set lock and fresh
+pending directory protect rebuilds, with an atomic Linux directory exchange for
+nonempty re-exports. Completion is `POST /worker/export/{set_id}/complete` with
+`{lease_id, result, host_store_root}` (the root is optional metadata for API
+callers); failure is `POST /worker/export/{set_id}/fail` with
+`{lease_id, error}`. Both require worker authentication and a live export lease.
+
+Markers:
+
+```text
+EXPORT set=<id> pairs=<n> exported=<n> skipped=<n>
+EXPORT failed set=<id>: <message>
+```
+
+The skipped marker counts all skipped items, including pairs with no version.
+Export completion is filesystem/repository evidence; the operator separately
+runs the live set export and Godot `verify_library.gd`.

@@ -288,6 +288,10 @@ class ForgeStore:
         result["unbound_kinds"] = unbound_kinds(result["manifest"], [k for k, p in pairs.items() if p["version"] is not None])
         result["unplaced_assets"] = unplaced_assets(result["manifest"])
         result["attention"] = [key for key, pair in pairs.items() if pair["attention"]]
+        export_path = self._set_dir(set_id) / "export.json"
+        export = self.get_export(set_id) if export_path.exists() else None
+        result["export"] = ({key: export[key] for key in ("status", "finished_at", "library_root")} |
+                            {"coverage": (export["result"] or {}).get("coverage")}) if export else None
         return result
 
     @locked
@@ -297,8 +301,104 @@ class ForgeStore:
             item = self.get_set(path.parent.name)
             results.append({key: item[key] for key in ("id", "name", "created_at")} | {
                 "requested_pairs": item["coverage"]["requested_pairs"],
-                "coverage": {"percent": item["coverage"]["percent"]}, "attention": len(item["attention"])})
+                "coverage": {"percent": item["coverage"]["percent"]}, "attention": len(item["attention"]),
+                "export_status": (item["export"] or {}).get("status")})
         return sorted(results, key=lambda s: (s["created_at"], s["id"]))
+
+    @locked
+    def get_export(self, set_id: str) -> dict:
+        directory = self._set_dir(set_id)
+        self._read(directory / "set.json")
+        record = self._read(directory / "export.json")
+        if (record["status"] == "running" and (not record["lease"] or
+                datetime.fromisoformat(record["lease"]["expires_at"]) <= self._now())):
+            record["history"].append({"status": "expired", "at": self._now().isoformat(),
+                                      "lease": record["lease"]})
+            record.update(status="requested", lease=None, started_at=None, finished_at=None)
+            self._write_json(directory / "export.json", record)
+        return record
+
+    @locked
+    def request_export(self, set_id: str) -> dict:
+        directory = self._set_dir(set_id)
+        self._read(directory / "set.json")
+        previous = self.get_export(set_id) if (directory / "export.json").exists() else None
+        if previous and previous["status"] == "running":
+            raise ForgeConflict("Export already has a live worker lease.")
+        history = previous["history"] if previous else []
+        if previous:
+            history.append({key: value for key, value in previous.items() if key != "history"})
+        record = {"status": "requested", "requested_at": self._now().isoformat(),
+                  "started_at": None, "finished_at": None, "lease": None,
+                  "library_root": f"sets/{set_id}/library_root", "result": None,
+                  "error": None, "history": history}
+        self._write_json(directory / "export.json", record)
+        return record
+
+    @locked
+    def claim_export(self, worker: str = "export") -> dict | None:
+        candidates = [(path.parent.name, self.get_export(path.parent.name))
+                      for path in self.root.glob("sets/*/export.json")]
+        for set_id, record in sorted(candidates, key=lambda item: (item[1]["requested_at"], item[0])):
+            if record["status"] != "requested":
+                continue
+            item = self.get_set(set_id)
+            # F1's projection stays latest-version; exports prefer accepted work.
+            for key, pair in item["pairs"].items():
+                asset, variant = key.split("/")
+                versions = self.list_versions(asset, variant)
+                accepted = [v for v in versions if v["accepted"]]
+                chosen = max(accepted or versions, key=lambda v: (v["created_at"], v["number"])) if versions else None
+                pair.update(version=chosen["number"] if chosen else None,
+                            accepted=bool(chosen and chosen["accepted"]),
+                            status="exported" if chosen else "skipped",
+                            reason=None if chosen else "no version")
+            now = self._now()
+            lease = {"lease_id": uuid4().hex, "worker": worker,
+                     "expires_at": (now + timedelta(seconds=300)).isoformat()}
+            record.update(status="running", started_at=now.isoformat(), lease=lease)
+            record["history"].append({"status": "running", "at": record["started_at"], "lease": lease})
+            self._write_json(self._set_dir(set_id) / "export.json", record)
+            return {"set_id": set_id, "export_lease": lease, "manifest": item["manifest"], "pairs": item["pairs"]}
+        return None
+
+    def _finish_export(self, set_id: str, lease_id: str, *, result=None, error=None, host_store_root=None) -> dict:
+        record = self.get_export(set_id)
+        if (record["status"] != "running" or not record["lease"] or
+                record["lease"]["lease_id"] != lease_id):
+            raise ForgeConflict("Missing, stale or expired export lease.")
+        if host_store_root is not None:
+            host = Path(host_store_root)
+            if not host.is_absolute() or ".." in host.parts or "\\" in host_store_root or "\x00" in host_store_root:
+                raise ForgeStoreError("Host store root must be an absolute path.")
+            # Metadata only: the API must never open a worker's host path.
+            record["host_store_root"] = str(host)
+        record.update(status="failed" if error is not None else "done", result=result, error=error,
+                      lease=None, finished_at=self._now().isoformat())
+        record["history"].append({"status": record["status"], "at": record["finished_at"], "error": error})
+        self._write_json(self._set_dir(set_id) / "export.json", record)
+        return record
+
+    @locked
+    def complete_export(self, set_id: str, *, lease_id: str, result: dict,
+                        host_store_root: str | None = None) -> dict:
+        return self._finish_export(set_id, lease_id, result=result, host_store_root=host_store_root)
+
+    @locked
+    def fail_export(self, set_id: str, *, lease_id: str, error: str) -> dict:
+        return self._finish_export(set_id, lease_id, error=error)
+
+    @locked
+    def export_file(self, set_id: str, name: str) -> Path:
+        if name not in {"asset_library.json", "city_bindings.json", "report.json"}:
+            raise FileNotFoundError("Unknown library file.")
+        record = self.get_export(set_id)
+        if record["status"] != "done":
+            raise FileNotFoundError("Export is not done.")
+        path = self.confined(Path(record["library_root"]) / "library" / name)
+        if not path.is_file():
+            raise FileNotFoundError(name)
+        return path
 
     @locked
     def set_style_file(self, set_id: str, n: int, asset: str | None = None,
@@ -1133,10 +1233,12 @@ class ForgeStore:
     @locked
     def claim_job(self, kind: str = "pipeline", stages: list[str] | None = None,
                   job_id: str | None = None) -> dict | None:
-        if kind not in {"pipeline", "critic"}:
+        if kind not in {"pipeline", "critic", "export"}:
             raise ForgeStoreError("Unknown worker kind.")
         if kind == "critic":
             return self.claim_critic()
+        if kind == "export":
+            return self.claim_export()
         now = self._now()
         jobs = self.list_jobs()
         for job in jobs:
