@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from threading import Thread
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -17,6 +17,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from open_sprite_pipeline.forge_worker import ForgeWorker, png, load_tool, main
 from open_sprite_pipeline.style_client import StyleClient, StyleBusy, StyleError
+from open_sprite_pipeline.forge_policy import Policy
 import test_forge_generate_worker as fixture
 
 
@@ -91,6 +92,57 @@ class StyleWorkerTests(unittest.TestCase):
         ready = self.worker.run_next()
         self.assertEqual(ready['state'], 'ready')
         return self.store.get_version('a', 'v', ready['version_number'])
+
+    def test_enforce_style_runs_unattended_to_accepted_version(self):
+        self.store.policy = Policy('enforce')
+        self.worker.style = FakeStyle(identity=False)
+        created = self.create(style={'enabled': True, 'seeds_per_view': 1})
+        self.worker.critic = Mock()
+        self.worker.critic.review.return_value = {
+            'status': 'warn', 'overall': 'warn', 'score': 85, 'issues': [],
+            'summary': 'Fake critic: acceptable texture warning.', 'model': 'fake-critic'}
+        with patch.object(self.client, 'request', wraps=self.client.request) as requests:
+            review = self.worker.run_next()
+            self.assertEqual(review['state'], 'review')
+            self.assertTrue(review['match']['submitted'])
+            self.assertEqual(review['match']['submitted_by'], 'policy')
+            queued = self.worker.run_next()
+            self.assertEqual(queued['state'], 'queued_bake')
+            ready = self.worker.run_next()
+            self.assertEqual(ready['state'], 'ready')
+            self.worker.run_critic_next()
+        self.assertFalse(any(call.args[0] == 'POST' and call.args[1].endswith(('/review', '/approve'))
+                             for call in requests.call_args_list))
+        version = self.store.get_version('a', 'v', ready['version_number'])
+        self.assertTrue(version['accepted'])
+        self.assertEqual(version['policy']['action'], 'accept')
+        job = self.store.get_job(created['id'])
+        self.assertNotIn('attention', job)
+        self.assertEqual(job['policy']['version'], version['policy'])
+
+    def test_enforce_identity_style_escalates_with_attention(self):
+        self.store.policy = Policy('enforce')
+        self.worker.style = FakeStyle(identity=True)
+        self.create(style={'enabled': True, 'seeds_per_view': 1})
+        job = self.worker.run_next()
+        self.assertEqual(job['state'], 'review')
+        self.assertFalse(job['match']['submitted'])
+        self.assertEqual(job['attention']['reason'], 'review')
+        self.assertEqual(len(job['policy']['review']['views_missing']), len(job['canonical_views']))
+        self.assertTrue(all('failed metrics' in reason for reason in job['attention']['detail']))
+        attention = self.http.get('/v1/forge/attention').json()
+        self.assertEqual([j['id'] for j in attention['jobs']], [job['id']])
+        self.assertIsNone(self.worker.run_next())
+
+    def test_enforce_palette_only_skips_worker_double_submit(self):
+        self.store.policy = Policy('enforce')
+        self.create(palette_only='true')
+        with patch.object(self.client, 'request', wraps=self.client.request) as requests:
+            job = self.worker.run_next()
+        self.assertEqual(job['state'], 'queued_bake')
+        self.assertEqual(job['match']['submitted_by'], 'policy')
+        self.assertFalse(any(call.args[0] == 'POST' and call.args[1].endswith('/review')
+                             for call in requests.call_args_list))
 
     def test_catalog_startup_and_after_bake_read_only_with_bad_yaml(self):
         (self.assets / 'specs/broken.yaml').write_text('asset: [unterminated')

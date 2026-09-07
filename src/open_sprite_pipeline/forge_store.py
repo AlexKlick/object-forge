@@ -7,6 +7,8 @@ index; listing rebuilds that index after an interrupted publication.
 """
 from __future__ import annotations
 
+from .forge_policy import Policy, decide_review, decide_bake, decide_version, palette_only
+
 from collections import deque
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -49,7 +51,8 @@ def locked(method):
 
 
 class ForgeStore:
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, policy: Policy | None = None) -> None:
+        self.policy = policy if policy is not None else Policy.from_env()
         Path(root).mkdir(parents=True, exist_ok=True)
         self.root = Path(root).resolve()
         self._lock = RLock()
@@ -684,7 +687,8 @@ class ForgeStore:
         return path
 
     @locked
-    def review(self, job_id: str, mode: str, panels: list[dict], views_missing: list[str]) -> dict:
+    def review(self, job_id: str, mode: str, panels: list[dict], views_missing: list[str],
+               *, actor: str = "human") -> dict:
         job = self.get_job(job_id)
         if job["state"] != "review":
             raise ForgeConflict("Review decisions require a review job.")
@@ -720,6 +724,16 @@ class ForgeStore:
         job["match"]["decisions"] = deepcopy(panels)
         job["match"]["views_missing"] = sorted(missing)
         if mode == "submit":
+            job["match"]["submitted_by"] = actor
+            if actor == "human":
+                job.pop("attention", None)
+                audit = job.setdefault("policy", {"mode": self.policy.mode})
+                previous = audit.get("review")
+                audit["review"] = {"action": "submit", "actor": actor, "at": self._now().isoformat(),
+                                   "panels": deepcopy(panels), "views_missing": sorted(missing),
+                                   "thresholds": self.policy.thresholds, "applied": True}
+                if previous:
+                    audit["review"]["recommendation"] = previous
             if job["match"].get("report_saved"):
                 job["match"]["submitted"] = True
             else:  # Preserve P1 reportless/manual review clients.
@@ -751,6 +765,13 @@ class ForgeStore:
 
     @locked
     def worker_match(self, job_id: str, report: dict, lease_id: str) -> dict:
+        job = self.get_job(job_id)
+        receipt = job.get("policy_receipts", {}).get("review")
+        if receipt is not None and receipt == lease_id:
+            saved = self._read(self._job_path(job_id).parent / "match/match_report.json")
+            if report != saved:
+                raise ForgeConflict("Match retry changed the evidence.")
+            return job
         self._worker_job(job_id, lease_id, "matching")
         panels = report.get("panels")
         if not isinstance(panels, list):
@@ -766,7 +787,19 @@ class ForgeStore:
         if set(report) - allowed:
             raise ForgeStoreError("Unknown match report field.")
         self.save_match_report(job_id, report)
-        return self.set_state(job_id, "review")
+        job = self.set_state(job_id, "review")
+        if self.policy.mode != "off":
+            decision = decide_review(self.policy, job, report)
+            applied = self.policy.mode == "enforce" and decision["action"] == "submit"
+            if applied:
+                job = self.review(job_id, "submit", decision["panels"], decision["views_missing"], actor="policy")
+            job.setdefault("policy", {}).update(mode=self.policy.mode, review={
+                **decision, "actor": "policy", "at": self._now().isoformat(), "applied": applied})
+            if decision["action"] == "escalate":
+                job["attention"] = {"reason": "review", "detail": decision["reasons"], "at": self._now().isoformat()}
+            job.setdefault("policy_receipts", {})["review"] = lease_id
+            return self._save_job(job)
+        return job
 
     @locked
     def worker_staged_view(self, job_id: str, view: str, payload: bytes, lease_id: str) -> None:
@@ -782,6 +815,9 @@ class ForgeStore:
 
     @locked
     def finish_staging(self, job_id: str, lease_id: str) -> dict:
+        job = self.get_job(job_id)
+        if lease_id is not None and job.get("policy_receipts", {}).get("bake") == lease_id:
+            return job
         job = self._worker_job(job_id, lease_id, "review")
         if not job["match"].get("submitted"):
             raise ForgeConflict("Review has not been submitted.")
@@ -796,7 +832,67 @@ class ForgeStore:
             self._file(directory / f"{view}.png")
         job.setdefault("inputs", {})["parent_views_inherited"] = sorted(inherited)
         self._save_job(job)
-        return self.set_state(job_id, "staged")
+        job = self.set_state(job_id, "staged")
+        if self.policy.mode != "off":
+            action = decide_bake(self.policy, job)
+            applied = self.policy.mode == "enforce" and action == "approve"
+            if applied:
+                job = self.set_state(job_id, "queued_bake")
+            job.setdefault("policy", {}).update(mode=self.policy.mode, bake={
+                "action": action, "actor": "policy", "at": self._now().isoformat(),
+                "thresholds": self.policy.thresholds, "applied": applied})
+            if action == "escalate":
+                job["attention"] = {"reason": "bake", "detail": ["Automatic baking is disabled."],
+                                    "at": self._now().isoformat()}
+            job.setdefault("policy_receipts", {})["bake"] = lease_id
+            return self._save_job(job)
+        return job
+
+    @locked
+    def approve(self, job_id: str) -> dict:
+        job = self.set_state(job_id, "queued_bake")
+        job.pop("attention", None)
+        return self._save_job(job)
+
+    @locked
+    def attention(self) -> dict:
+        jobs = [j for j in self.list_jobs() if j.get("attention")]
+        jobs.sort(key=lambda j: (j["attention"]["at"], j["created_at"], j["id"]))
+        versions = [v for v in self.list_versions() if v.get("attention")]
+        versions.sort(key=lambda v: (v["attention"]["at"], v["asset"], v["variant"], v["number"]))
+        return {"jobs": [{k: v for k, v in j.items() if k not in {"worker_log", "policy_receipts"}}
+                         for j in jobs], "versions": versions}
+
+    @locked
+    def policy_override(self, job_id: str, action: str, author: str) -> dict:
+        if action not in {"submit", "approve", "accept", "dismiss"} or not isinstance(author, str) or not author.strip():
+            raise ForgeStoreError("Override requires a supported action and author.")
+        job = self.get_job(job_id)
+        decision = None
+        if action == "submit":
+            decision = decide_review(self.policy, job, job["match"])
+            if decision["views_missing"] and not palette_only(job):
+                raise ForgeConflict("Policy override would leave canonical views uncovered.")
+            job = self.review(job_id, "submit", decision["panels"], decision["views_missing"])
+        elif action == "approve":
+            job = self.approve(job_id)
+        elif action == "accept":
+            if job.get("version_number") is None:
+                raise ForgeConflict("Job has no published version.")
+            self.accept_version(job["asset"], job["variant"], job["version_number"], True)
+            job = self.get_job(job_id)
+        job.pop("attention", None)
+        if job.get("version_number") is not None:
+            version = self.get_version(job["asset"], job["variant"], job["version_number"])
+            version.pop("attention", None)
+            self._write_json(self._version_dir(job["asset"], job["variant"], job["version_number"]) / "version.json", version)
+            self._index(job["asset"], job["variant"])
+        record = {"action": action, "author": author, "actor": "human", "at": self._now().isoformat(),
+                  "thresholds": self.policy.thresholds}
+        if decision is not None:
+            record["decision"] = decision
+        job.setdefault("policy", {"mode": self.policy.mode}).setdefault("overrides", []).append(record)
+        return self._save_job(job)
 
     @locked
     def append_worker_log(self, job_id: str, lines: list[str]) -> None:
@@ -887,7 +983,10 @@ class ForgeStore:
     @staticmethod
     def _summary(version: dict) -> dict:
         return {key: version[key] for key in ("number", "asset", "variant", "origin", "job_id",
-                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", []), "critic": version.get("critic", {"status": "pending"}), "style": version.get("style", version.get("metrics", {}).get("style"))}
+                                              "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", []), "critic": version.get("critic", {"status": "pending"}), "style": version.get("style", version.get("metrics", {}).get("style")),
+            "attention": version.get("attention"),
+            "policy": {key: version.get("policy", {})[key] for key in ("mode", "action")
+                       if key in version.get("policy", {})}}
 
     @locked
     def claim_critic(self) -> dict | None:
@@ -937,6 +1036,11 @@ class ForgeStore:
         from .forge_critic import validate_verdict
 
         version = self.get_version(asset, variant, number)
+        if lease_id is not None and version.get("policy_critic_receipt") == lease_id and version["critic"]["status"] != "pending":
+            saved = self.get_critic(asset, variant, number)
+            if {k: v for k, v in saved.items() if k != "at"} != {k: v for k, v in verdict.items() if k != "at"}:
+                raise ForgeConflict("Critic retry changed the evidence.")
+            return saved
         lease = version.get("critic_lease")
         if (not lease or lease["lease_id"] != lease_id
                 or datetime.fromisoformat(lease["lease_expires_at"]) <= self._now()
@@ -962,6 +1066,35 @@ class ForgeStore:
         directory = self._version_dir(asset, variant, number)
         self._write_json(directory / "critic" / "critic.json", verdict)
         self._write_json(directory / "version.json", version)
+        if self.policy.mode != "off":
+            decision = decide_version(self.policy, version)
+            applied = self.policy.mode == "enforce" and decision["action"] == "accept"
+            if applied:
+                version = self.accept_version(asset, variant, number, True)
+            record = {**decision, "mode": self.policy.mode, "actor": "policy", "at": verdict["at"],
+                      "applied": applied}
+            version["policy"] = record
+            version["policy_critic_receipt"] = lease_id
+            if decision["action"] == "flag":
+                version["attention"] = {"reason": "critic", "detail": decision["reasons"], "at": verdict["at"]}
+            else:
+                version.pop("attention", None)
+            self._write_json(directory / "version.json", version)
+            if version.get("job_id"):
+                try:
+                    job = self.get_job(version["job_id"])
+                except FileNotFoundError:
+                    pass
+                else:
+                    audit = job.setdefault("policy", {})
+                    if "version" in audit:
+                        audit.setdefault("version_history", []).append(audit["version"])
+                    audit.update(mode=self.policy.mode, version=deepcopy(record))
+                    if decision["action"] == "flag":
+                        job["attention"] = deepcopy(version["attention"])
+                    elif job.get("attention", {}).get("reason") == "critic":
+                        job.pop("attention", None)
+                    self._save_job(job)
         self._index(asset, variant)
         return verdict
 
@@ -1178,6 +1311,7 @@ class ForgeStore:
     def accept_version(self, asset: str, variant: str, number: int, accepted: bool = True) -> dict:
         version = self.get_version(asset, variant, number)
         version["accepted"] = accepted
+        version.pop("attention", None)
         self._write_json(self._version_dir(asset, variant, number) / "version.json", version)
         try:
             if not version.get("job_id"):
@@ -1187,6 +1321,7 @@ class ForgeStore:
             pass
         else:
             job["accepted"] = accepted
+            job.pop("attention", None)
             self._save_job(job)
         self._index(asset, variant)
         return version

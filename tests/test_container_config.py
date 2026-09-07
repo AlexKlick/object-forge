@@ -28,6 +28,9 @@ class ComposeServiceTests(unittest.TestCase):
         reaching queued_bake — so this is worth pinning."""
         self.assertEqual(str(self.service.get("user", "")), "1000:1000")
 
+    def test_unattended_policy_is_enforced(self) -> None:
+        self.assertEqual(self.service["environment"]["FORGE_POLICY"], "enforce")
+
     def test_store_bind_mount_is_present(self) -> None:
         self.assertIn("../.runs/trellis2-container:/data/runs", self.service["volumes"])
         self.assertEqual(self.service["environment"]["OPEN_SPRITE_UI_ROOT"], "/data/runs/ui")

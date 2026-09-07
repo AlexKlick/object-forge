@@ -65,11 +65,85 @@ creation remains permissive. Variants are not enforced. The empty picker says
 “No catalog published yet — start the host worker”; restart the worker to refresh
 a changed catalog before the next bake, then reopen the Forge tab.
 
+## Unattended operation
+
+U1 runs policy decisions in the API-owned store at match publication, staging
+completion, and critic completion. The worker still needs a submitted review to
+stage and an approved queue entry to bake. No UI changes are required. Configure
+policy on the server; the host worker does not own these decisions.
+
+`FORGE_POLICY=off` preserves manual operation and writes no automatic policy
+records. `advisory` records recommendations and attention entries but does not
+submit, queue, or accept. `enforce` applies admissible decisions automatically.
+The interactive compose service selects `enforce`; other deployments default to
+`off`. Invalid policy settings fail server initialization. Boolean settings accept
+`true/false`, `1/0`, `yes/no`, and `on/off` (case insensitive).
+
+At review, each canonical view prefers a style candidate with passing metrics and,
+by default, passing PNG checks, ranked by lowest palette drift. Otherwise an
+ordinary candidate must have the matching `auto_view`, no rejection reason, and
+IoU at least 0.85. Every unselected panel is rejected. Inherited views count as
+covered. Uncovered views require attention, except `from_spec` with
+`palette_only`, which explicitly permits missing views. A human may still use the
+normal review route to submit deliberately missing views.
+
+After staging a submitted human or policy review, enforcement queues the bake
+when `auto_bake` is true. Disabling it leaves the job staged with bake attention.
+Published versions have already passed the worker's GLB gate. Policy acceptance
+then requires critic `pass`, or `warn` with `accept_on_warn` and score at least 70.
+`fail`, `error`, low warnings, and skipped bake critics require attention. A
+skipped critic is acceptable for a `trellis` version when evaluated by policy.
+Any failed per-view style metric flags the version even if the critic passes.
+Imported versions without jobs do not run the critic completion hook.
+
+`GET /v1/forge/policy` returns the active mode and thresholds.
+`GET /v1/forge/attention` returns jobs (oldest attention first) and version
+summaries that need human attention. Jobs and library rows carry policy metadata.
+Human review submission, approval, and version acceptance clear attention at their
+respective write points. A new critic run may flag a previously accepted version;
+acceptance remains an explicit historical choice until a human changes it, and
+the new attention entry identifies the unresolved verdict.
+
+To override a job, send JSON to
+`POST /v1/forge/jobs/{id}/policy/override`, for example:
+
+```json
+{"action": "accept", "author": "operator"}
+```
+
+Actions are `submit`, `approve`, `accept`, and `dismiss`. `submit` recomputes the
+policy's best panel choices and submits them as a human decision. It returns 409
+if canonical views remain uncovered without `palette_only`; use the normal human
+review route to make an explicit missing-view choice. `approve` queues a staged
+job, `accept` accepts its published version, and `dismiss` only clears job/version
+attention. All successful overrides append author, action, time, and thresholds
+to `job.policy.overrides`; invalid actions do not append a record.
+
+Decisions are audited so an operator can reconstruct why a job advanced or
+stopped: `job.policy` records the mode and each review, bake, and version decision,
+including actor, time, thresholds, and whether it was applied. `version.policy`
+mirrors the version decision. A human review retains the preceding recommendation;
+new critic runs retain previous version decisions in the job's version history.
+Retries with the same completion lease and evidence return the existing result
+without submitting twice or duplicating audit records. Different evidence or an
+unrelated lease is refused. The pure bake helper returns its action string; the
+store attaches the full threshold snapshot to its audit record.
+
+Repository tests use fake style and critic responses. Operator zero-click rounds
+remain necessary for live acceptance, including real style, bake, critic, and
+cleanup evidence.
+
 ## Environment
 
 | Process | Variable | Default / meaning |
 | --- | --- | --- |
 | Server | `FORGE_ENABLED` | Unset disables Forge routes; compose sets `1`. |
+| Server | `FORGE_POLICY` | `off` by default; `off`, `advisory`, or `enforce`. Interactive compose sets `enforce`. |
+| Server | `FORGE_POLICY_MIN_IOU` | `0.85`; finite number in [0, 1], ordinary panel silhouette threshold. |
+| Server | `FORGE_POLICY_REQUIRE_CHECKS` | `true`; require passing style PNG checks alongside style metrics. |
+| Server | `FORGE_POLICY_MIN_CRITIC` | `70`; integer in [0, 100], minimum score for accepting a critic warning. |
+| Server | `FORGE_POLICY_ACCEPT_ON_WARN` | `true`; permit warnings meeting the critic score threshold. |
+| Server | `FORGE_POLICY_AUTO_BAKE` | `true`; queue bakes after a submitted review is staged. |
 | Server + worker | `FORGE_WORKER_TOKEN` | Unset/empty means no worker-token check. If set, pass the identical value to both processes; worker sends `X-Forge-Worker`. Keep real tokens out of committed files. |
 | Worker | `FORGE_API` | `http://127.0.0.1:8070` for dev; set `http://127.0.0.1:8050` for this deployment. HTTP loopback IP origin only. |
 | Worker | `FORGE_SPIKE_ASSETS` | `/home/alexk/debt-city-greybox-spike/apps/greybox/assets`. Must be disjoint from the resolved store in both directions. |

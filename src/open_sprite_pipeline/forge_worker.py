@@ -1204,8 +1204,9 @@ class ForgeWorker:
         palette_only = job["intent"] == "from_spec" and job["generate"]["palette_only"]
         if job["state"] == "matching" and ((empty_iteration and not report["views_missing"])
                                            or (palette_only and not report["panels"])):
-            self.client.request("POST", f"/jobs/{job['id']}/review", {
-                "mode": "submit", "panels": [], "views_missing": report["views_missing"]})
+            if not result["match"].get("submitted"):
+                self.client.request("POST", f"/jobs/{job['id']}/review", {
+                    "mode": "submit", "panels": [], "views_missing": report["views_missing"]})
             claimed = self.client.request("POST", "/worker/claim", {"stages": ["review"], "job_id": job["id"]})
             if claimed and palette_only:
                 self.progress(claimed, "MATCH skipped: palette-only authored spec")

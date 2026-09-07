@@ -506,7 +506,8 @@ class ForgeApiTests(unittest.TestCase):
         self.assertNotEqual(parent["id"], child["id"])
         self.assertEqual(child["parent_version"], 1)
         self.assertEqual(child["parent_job"], parent["id"])
-        self.assertEqual(self.client.get("/v1/forge/jobs?state=uploaded&asset=chair").json(), [child])
+        self.assertEqual(self.client.get("/v1/forge/jobs?state=uploaded&asset=chair").json(),
+                         [{**child, "attention": None, "policy": {"mode": "off"}}])
         self.assertEqual(self.client.get("/v1/forge/jobs?asset=missing").json(), [])
         self.assertEqual(self.client.get("/v1/forge/assets").json(), [{"asset": "chair", "variant": "oak"}])
 

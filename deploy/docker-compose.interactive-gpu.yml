@@ -26,6 +26,13 @@ services:
       OPEN_SPRITE_PIPELINE_CONFIG: /app/configs/app.container.yaml
       OPEN_SPRITE_UI_ROOT: /data/runs/ui
       FORGE_ENABLED: "1"
+      # Server-owned decisions: evidence is audited; uncertain work awaits a human.
+      FORGE_POLICY: enforce
+      FORGE_POLICY_MIN_IOU: "0.85"  # Ordinary panels must match canonical silhouettes.
+      FORGE_POLICY_REQUIRE_CHECKS: "true"  # Style PNG checks must pass as well as metrics.
+      FORGE_POLICY_MIN_CRITIC: "70"  # Warn verdicts below this score require attention.
+      FORGE_POLICY_ACCEPT_ON_WARN: "true"  # Permit bounded critic warnings.
+      FORGE_POLICY_AUTO_BAKE: "true"  # Submitted human/policy reviews may bake.
       # Set only if you also pass the same token to the host worker.
       # FORGE_WORKER_TOKEN: ""
       OPEN_SPRITE_SEGMENTER: sam2

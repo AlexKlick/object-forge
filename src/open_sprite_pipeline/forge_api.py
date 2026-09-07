@@ -239,7 +239,10 @@ async def create_job(request: Request):
 
 @forge_router.get("/jobs")
 def jobs(request: Request, state: str | None = None, asset: str | None = None):
-    return store(request).list_jobs(state=state, asset=asset)
+    target = store(request)
+    return [{**job, "attention": job.get("attention"),
+             "policy": {"mode": target.policy.mode, **job.get("policy", {})}}
+            for job in target.list_jobs(state=state, asset=asset)]
 
 
 @forge_router.get("/jobs/{job_id}")
@@ -405,7 +408,7 @@ def staged(request: Request, job_id: str, body: Lease):
 
 @forge_router.post("/jobs/{job_id}/approve")
 def approve(request: Request, job_id: str):
-    return store(request).set_state(job_id, "queued_bake")
+    return store(request).approve(job_id)
 
 
 @forge_router.post("/jobs/{job_id}/progress", dependencies=[Depends(worker_auth)])
@@ -492,3 +495,24 @@ def rerun_critic(request: Request, asset: str, variant: str, number: int):
 @forge_router.post(_VERSION + "/{number}/critic", dependencies=[Depends(worker_auth)])
 def save_critic(request: Request, asset: str, variant: str, number: int, body: CriticComplete):
     return store(request).complete_critic(asset, variant, number, body.lease_id, body.verdict)
+
+
+class PolicyOverride(Payload):
+    action: Literal["submit", "approve", "accept", "dismiss"]
+    author: str = Field(min_length=1, max_length=128)
+
+
+@forge_router.get("/policy")
+def policy(request: Request):
+    settings = store(request).policy
+    return {"mode": settings.mode, "thresholds": settings.thresholds}
+
+
+@forge_router.get("/attention")
+def attention(request: Request):
+    return store(request).attention()
+
+
+@forge_router.post("/jobs/{job_id}/policy/override")
+def policy_override(request: Request, job_id: str, body: PolicyOverride):
+    return store(request).policy_override(job_id, body.action, body.author)

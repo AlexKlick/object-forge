@@ -77,11 +77,18 @@ class ForgePruneTests(unittest.TestCase):
 
     def test_apply_removes_only_eligible_versions_jobs_and_rebuilds_index(self):
         versions = [self.version() for _ in range(4)]
+        # Offline reindexing must preserve U1 attention and the same compact
+        # policy projection as the API, without copying full decision evidence.
+        versions[-1]['attention'] = {'reason': 'critic', 'detail': ['fixture'], 'at': self.old.isoformat()}
+        versions[-1]['policy'] = {'mode': 'enforce', 'action': 'flag', 'thresholds': {'min_critic': 70}}
+        self.store._write_json(self.store._version_dir('a', 'v', 4) / 'version.json', versions[-1])
         failed = self.job()
         recent = self.job(old=False)
         self.run_prune(keep_versions=2, apply=True)
         index = json.loads((self.root / "assets/a/variants/v/versions.json").read_bytes())
         self.assertEqual([v["number"] for v in index], [3, 4])
+        self.assertEqual(index[-1]['attention'], versions[-1]['attention'])
+        self.assertEqual(index[-1]['policy'], {'mode': 'enforce', 'action': 'flag'})
         self.assertEqual(self.store.list_versions("a", "v"), index)
         ids = {job["id"] for job in self.store.list_jobs()}
         self.assertEqual(ids, {versions[2]["job_id"], versions[3]["job_id"], recent["id"]})
