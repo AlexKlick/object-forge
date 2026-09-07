@@ -36,6 +36,9 @@ The operator confirmed this existing directory; no bind-mount change is needed.
 | Worker | `FORGE_API` | `http://127.0.0.1:8070` for dev; set `http://127.0.0.1:8050` for this deployment. HTTP loopback IP origin only. |
 | Worker | `FORGE_SPIKE_ASSETS` | `/home/alexk/debt-city-greybox-spike/apps/greybox/assets`. Must be disjoint from the resolved store in both directions. |
 | Worker | `FORGE_STORE_ROOT` | Unset uses the API-reported root (shared-filesystem dev). For containers set the absolute host root shown below; relative/empty overrides are rejected and symlinks are resolved. Covers locks and recovery snapshots. |
+| Worker | `FORGE_SYNTH_CMD` | Unset uses companion `tools/spec_synth.py`; template accepts `{inputs}`, `{asset}`, `{out}`, `{height_hint}`, `{floor_height}`, `{report}`, plus `{edit_in}` and `{edit}` for surgery. |
+| Worker | `FORGE_BLOCKOUT_CMD` | Unset uses companion `tools/blockout.py`; template accepts `{spec}`, `{out}`. |
+| Worker | `FORGE_BAKE_CMD` | Unset uses companion `tools/bake.py`; whole-command template accepts `{assets_root}`, `{spec}`. Overrides receive no appended arguments; see the Gen Ladder workspace section. |
 | Worker | `FORGE_BAKE_PYTHON` | `/home/alexk/.venv/bin/python`, the host interpreter for spike `tools/bake.py`; separate from the repo worker interpreter. |
 | Worker | `FORGE_CRITIC_URL` | `http://127.0.0.1:18001/v1`; empty disables. Only loopback HTTP is allowed. |
 | Worker | `FORGE_CRITIC_MODEL` | `Qwen/Qwen3.5-4B`, the current code default; operator verifies the model served on the critic lane. |
@@ -168,6 +171,155 @@ override even if this advisory check cannot establish identity.
    restored spike inputs, and the critic outcome or explicit skipped reason.
    ACCEPTED is a separate human library decision. Capture the real job/version
    identifiers and browser/worker evidence for the operator E2E gate.
+
+## Gen Ladder: Capture import to Library (GL1)
+
+Capture's **Save to Library** publishes a completed TRELLIS run directly;
+**Open Library** opens the resulting library view. The API contract is
+`POST /v1/ui/runs/{record_key}/library` with JSON such as
+`{"asset":"chair","variant":"default"}`. The UI defaults the asset to the
+normalized upload filename (or `trellis-asset` for a restored session without
+one) and the variant to `default`.
+
+First publication returns **201**; repeating the record key returns **200** and
+the existing version, including concurrent requests. Deduplication is library-wide:
+changing asset/variant on a retry does not publish another version. A retry
+still needs the completed run record, but after successful publication it does
+not need the original artifact files. Unknown records return **404**; incomplete
+runs, missing primary assets, unsafe paths, oversized artifacts or GLB gate
+violations return **422**. Disabled Forge returns **503** on this import route.
+
+Each artifact has a **256 MiB** ceiling. Import uses filesystem placement,
+not the worker completion route's base64/32 MiB per-artifact contract. The GLB
+passes the existing inspection gate and becomes `artifacts/model.glb`; the
+first existing MP4 preview, when present, becomes `artifacts/preview.mp4`.
+Source files must be regular files under the artifact root with no symlink
+components. Import uses a hard link, falling back to `copy2` if linking fails:
+**link-not-move** keeps Capture's `/v1/artifacts` paths working. Only the store's
+pending directory is renamed. Failed unpublished imports consume no version.
+
+Imported versions have `origin=trellis`, `job_id=null`, run provenance, GLB
+inspection and byte-size metadata, and empty part layers. Atlas coverage is
+unmeasured without an atlas. The critic is pre-skipped; rerun remains skipped
+because there is no worker job. Operators can accept these versions, but they
+have no job-history fetch or iteration action and are excluded from iteration
+parent selection. History shows the Capture run.
+
+## Gen Ladder: generate and blockout review (GL4)
+
+Create a job at `POST /v1/forge/jobs` with multipart `asset`, `variant`,
+`intent=generate`, and uploaded `files`, Capture `segment_refs`, or both.
+`segment_refs` is a JSON array of `{"image_id":"...","segment_id":"..."}`.
+Supply one to seven combined photos/cutouts; eight or more return **422** and
+no selected input is silently dropped. The underlying store's eight-reference
+limit does not raise this API limit. `height_hint` is 1–300 meters (default 12)
+and `floor_height` is 1–10 meters (default 3).
+
+The host worker runs `spec_synth → blockout renders → match → review`, using
+`--force-single` for one input and CPU rendering by default. It synthesizes a
+spec, renders five canonical views, then matches the source panels to them.
+In review, inspect the blockout geometry, palette, confidence, assumptions,
+next-view guidance and synthesis report alongside panel assignments.
+`GET /v1/forge/jobs/{id}/blockout` returns that review data (404 before synthesis),
+`GET /v1/forge/jobs/{id}/renders/{view}.png` serves a retained render, and
+`GET /v1/forge/jobs/{id}/blockout/spec.yaml` serves the retained spec.
+The cutout proxy is **`GET /v1/forge/jobs/{id}/cutouts/{n}.png`** (or
+`GET /jobs/{id}/cutouts/{n}.png` relative to `/v1/forge`); `n` is the zero-based
+index in the job's Capture references, not a panel number.
+
+Before submitting a generate review, use
+`POST /v1/forge/jobs/{id}/blockout/regenerate` with optional `height_hint`,
+`floor_height`, `tower_override`, and `palette_hex` hints. `tower_override`
+accepts `none`, `keep`, or an object with positive `width` and `location`
+(`rear_center`, `front_center`, or `center`). `palette_hex` maps existing roles
+to six hex digits, optionally prefixed with `#`. `none` removes the tower;
+`keep` retains photo inference. Width/location and palette changes use the
+companion's validated surgery after photo synthesis, retaining the original
+photo confidence with an operator-edit assumption.
+
+Regeneration is restricted to `intent=generate`, **unsubmitted review**, and
+at most **eight regenerations per job**. It clears match decisions and the
+lease and transitions **`review → matching`**. Review the fresh result before
+submitting. Submit freezes the decisions; the worker then materializes the
+staged views. Explicit bake approval is still required before
+`queued_bake → baking → ready`, followed by the separate human ACCEPTED choice.
+
+If every panel is rejected and all views are missing, a generate-family job
+can have **zero staged views**. After normal review, staging and approval, the
+default worker command passes `--allow-palette-only` for a degraded bake using
+the spec palette. The log says `NO staged views — palette-only degraded bake`.
+This is not photographic coverage; inspect the resulting geometry and colors.
+The GLB validation gate still applies. Completed generate-family versions use
+`origin=bake`, retain `blockout/spec.yaml`, and expose synthesis geometry and
+confidence under `metrics.synth`.
+
+## Gen Ladder: iterate a blockout (GL5)
+
+Use **Edit blockout** on a version with `blockout/spec.yaml`. API creation is
+multipart `POST /v1/forge/jobs` with `asset`, `variant`,
+`intent=iterate_blockout`, `parent_job`, `parent_version`, and JSON `edit`.
+The parent must be a generate-family job and the selected version must belong
+to that job and asset/variant. New uploads, synthesis hints and replacement
+views are refused. Bake/match settings stay in `params`; the API stores the
+geometry edit separately in `generate.edit`.
+
+Send at least one supported edit; the UI sends only changed values:
+
+| Edit key | Contract |
+| --- | --- |
+| `height` | Finite number, 1–300 meters. |
+| `floor_height` | Finite number, 1–10 meters. |
+| `plinth_floors` | Integer, 1–40. |
+| `tower` | Object with boolean `enabled`; optional positive `width` up to 300 meters and `location` in `rear_center`, `front_center`, `center`. Width/location require an enabled tower. |
+| `palette` | Nonempty role-to-color map; exactly six hex digits **without `#`**. The companion validates inherited palette roles. |
+
+The companion applies tower toggles first, scales section heights for a height
+edit, recomputes floors using each section's floor height, then applies an
+explicit `plinth_floors` last. Floor quantization can change the resulting total
+height from the request. Review shows geometry and palette from the resulting
+spec; use those values to assess the edit.
+
+The worker copies the selected parent spec into its workspace, applies surgery
+to a distinct output, renders again and rematches inherited source uploads and
+Capture references. It inherits neither staged coverage nor saved decisions:
+review every view again, then stage and explicitly approve the child bake.
+Child review omits photo regeneration controls. Lineage retains the selected
+parent and original root; the parent version remains unchanged.
+
+## Gen Ladder workspace and command contracts
+
+Generate and `iterate_blockout` jobs write beneath
+`<store>/assets/<a>/workspace/<v>/`, where `<a>` is the asset and `<v>` is the
+**variant**, not the version number. The workspace contains `specs/`, `in/`,
+`blockouts/`, `renders/`, `styled/` and `bakes/`. Companion tools remain in the
+spike tree; workspace copies have independent bytes and reject symlink/hardlink
+aliases. The host store override must resolve to the API's mounted store.
+
+All jobs for a pair share the workspace. The worker holds
+`<store>/locks/<a>__<v>.workspace.lock` across workspace matching, staging and
+baking, including claims. Ordinary spike bakes keep the separate
+`<store>/locks/<a>__<v>.lock` namespace and snapshot/restore protocol. Before
+staging or baking, the worker restores that job's API-retained spec/renders;
+before each bake it copies the API-owned staged PNGs. A different job may have
+used the workspace during review, so do not substitute its current files or
+delete a held lock to resume work.
+
+Command overrides in the environment table are split with `shlex.split`
+**before** placeholder substitution and run without a shell. `{inputs}` must
+be a standalone token: for synthesis it expands to repeated `--image PATH`
+arguments plus single-input/tower flags; for surgery it expands to
+`--edit-in PATH --edit JSON`. GL5 also supports explicit `{edit_in}` and
+`{edit}` placeholders. `{out}` is the synthesized/edited spec for synthesis,
+and the workspace assets root for blockout (renders go beneath `renders/`). `{assets_root}` and `{spec}` select
+the workspace for generated bakes. An override is the whole argument list;
+without placeholders it is unchanged, and no default flags are appended.
+Custom bake commands must include any required palette-only flag themselves.
+
+The companion synthesizes a `default` variant. For a named Forge variant, the
+worker adds an empty alias in the workspace spec, renders `default`, and copies
+canonical PNGs into the requested variant directory without changing geometry
+or companion files. Default bake execution receives the requested variant and
+explicit workspace `--assets-root`/`--spec` paths.
 
 ## User service (optional operator install)
 
