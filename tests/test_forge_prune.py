@@ -80,6 +80,7 @@ class ForgePruneTests(unittest.TestCase):
         # Offline reindexing must preserve U1 attention and the same compact
         # policy projection as the API, without copying full decision evidence.
         versions[-1]['attention'] = {'reason': 'critic', 'detail': ['fixture'], 'at': self.old.isoformat()}
+        versions[-1]['set_id'] = 'f' * 32
         versions[-1]['policy'] = {'mode': 'enforce', 'action': 'flag', 'thresholds': {'min_critic': 70}}
         self.store._write_json(self.store._version_dir('a', 'v', 4) / 'version.json', versions[-1])
         failed = self.job()
@@ -87,6 +88,8 @@ class ForgePruneTests(unittest.TestCase):
         self.run_prune(keep_versions=2, apply=True)
         index = json.loads((self.root / "assets/a/variants/v/versions.json").read_bytes())
         self.assertEqual([v["number"] for v in index], [3, 4])
+        self.assertEqual(index[-1]['set_id'], 'f' * 32)
+        self.assertNotIn('set_id', index[0])
         self.assertEqual(index[-1]['attention'], versions[-1]['attention'])
         self.assertEqual(index[-1]['policy'], {'mode': 'enforce', 'action': 'flag'})
         self.assertEqual(self.store.list_versions("a", "v"), index)

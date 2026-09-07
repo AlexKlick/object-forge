@@ -14,6 +14,8 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import json
+from io import BytesIO
+from PIL import Image, UnidentifiedImageError
 import math
 import os
 from pathlib import Path
@@ -157,6 +159,223 @@ class ForgeStore:
     def get_catalog(self) -> dict:
         path = self.confined("catalog.json")
         return self._read(path) if path.exists() else {"specs": [], "prompts": [], "published_at": None}
+
+    @staticmethod
+    def validate_image(data: bytes) -> str:
+        """The same image validation for standalone uploads and set attachments."""
+        if not data or len(data) > 20 * 1024 * 1024:
+            raise ForgeStoreError("Each image must be nonempty and at most 20 MiB.")
+        try:
+            with Image.open(BytesIO(data)) as image:
+                media_type = Image.MIME.get(image.format)
+                if image.width * image.height > 36_000_000:
+                    raise ForgeStoreError("Image exceeds 36 million pixels.")
+                image.verify()
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+            raise ForgeStoreError("Upload is not a supported image.") from exc
+        if media_type not in _IMAGE_EXT:
+            raise ForgeStoreError("Unsupported image format.")
+        return media_type
+
+    def _set_dir(self, set_id: str) -> Path:
+        return self.confined(Path("sets") / self._name(set_id))
+
+    @locked
+    def create_set(self, manifest_text: str, board_files: list, pair_files: dict) -> dict:
+        from .forge_sets import load_manifest
+        manifest = load_manifest(manifest_text)
+        required = {p["asset"] + "/" + p["variant"] for p in manifest["requires"]}
+        for key in pair_files:
+            parts = key.split("/")
+            if len(parts) != 2:
+                raise ForgeStoreError("Invalid path identifier.")
+            for part in parts:
+                self._name(part)
+            if key not in required:
+                raise ForgeStoreError(f"set {manifest['name']}: pair {key} is not required")
+
+        def uploads(files):
+            result = {}
+            for filename, media_type, data in files:
+                if media_type not in _IMAGE_EXT:
+                    raise ForgeStoreError("A supported, nonempty image is required.")
+                detected = self.validate_image(data)
+                name = Path(filename).name
+                if name in result:
+                    raise ForgeStoreError(f"set {manifest['name']}: duplicate upload {name}")
+                result[name] = (name, detected, data)
+            return result
+
+        board = uploads(board_files)
+        per_pair = {key: uploads(files) for key, files in pair_files.items()}
+        prepared = []
+
+        def resolve(names, files, directory):
+            records = []
+            for index, name in enumerate(names):
+                if name not in files:
+                    raise ForgeStoreError(f"set {manifest['name']}: missing upload {name}")
+                filename, media_type, data = files[name]
+                relative = f"{directory}/{index}.{_IMAGE_EXT[media_type]}"
+                prepared.append((relative, data))
+                records.append({"index": index, "filename": filename, "media_type": media_type,
+                                "path": relative})
+            return records
+
+        board_records = resolve(manifest["style"]["board"], board, "style")
+        pair_records = {}
+        for pair in manifest["requires"]:
+            key = pair["asset"] + "/" + pair["variant"]
+            directory = "pairs/" + pair["asset"] + "__" + pair["variant"]
+            files = per_pair.get(key, {})
+            pair_records[key] = {
+                "style": resolve(pair.get("style_refs", []), files, directory + "/style"),
+                "sources": resolve(pair["sources"], files, directory + "/sources"),
+            }
+        at = self._now().isoformat()
+        result = {"id": uuid4().hex, "name": manifest["name"], "manifest": manifest,
+                  "created_at": at, "updated_at": at, "pairs": {}, "launches": [],
+                  "files": {"style": board_records, "pairs": pair_records}}
+        directory = self._set_dir(result["id"])
+        try:
+            self._write_bytes(directory / "manifest.yaml", manifest_text.encode("utf-8"))
+            for relative, data in prepared:
+                self._write_bytes(directory / relative, data)
+            self._write_json(directory / "set.json", result)
+            return self.get_set(result["id"])
+        except Exception:
+            if directory.exists():
+                shutil.rmtree(self._checked(directory))
+            raise
+
+    @locked
+    def get_set(self, set_id: str) -> dict:
+        from .forge_sets import coverage, pair_plan, unbound_kinds, unplaced_assets
+        result = self._read(self._set_dir(set_id) / "set.json")
+        jobs = self.list_jobs(set_id=set_id)
+        pairs = {}
+        for pair in result["manifest"]["requires"]:
+            asset, variant = self._name(pair["asset"]), self._name(pair["variant"])
+            children = [j for j in jobs if (j["asset"], j["variant"]) == (asset, variant)]
+            job = children[-1] if children else {}
+            versions = self.list_versions(asset, variant)
+            version = max(versions, key=lambda v: (v["created_at"], v["number"])) if versions else None
+            attention = job.get("attention") or (version or {}).get("attention")
+            state = job.get("state", "planned")
+            last_skip = next((s for launch in reversed(result["launches"])
+                              for s in launch["skipped"] if (s["asset"], s["variant"]) == (asset, variant)
+                              and s["reason"] == "no spec in catalog"), {})
+            reason = job.get("error") or (attention or {}).get("reason")
+            if (not job and last_skip and asset not in
+                    {spec["asset"] for spec in self.get_catalog()["specs"]}):
+                state, reason = "blocked", last_skip["reason"]
+            complete = False
+            if version:
+                report_path = self._version_dir(asset, variant, version["number"]) / "artifacts/bake_report.json"
+                if self._checked(report_path).exists():
+                    complete = not self._read(report_path).get("views_missing", [])
+                elif "views_missing" in version["metrics"]:
+                    complete = not version["metrics"]["views_missing"]
+            pairs[asset + "/" + variant] = {
+                "job_id": job.get("id"), "intent": job.get("intent", pair_plan(result["manifest"], pair)["intent"]),
+                "state": state, "accepted": bool(version and version["accepted"]),
+                "version": version["number"] if version else None, "attention": attention,
+                "policy_mode": job.get("policy", {}).get("mode", self.policy.mode), "reason": reason,
+                "views_complete": complete,
+            }
+        result["pairs"] = pairs
+        result.update(coverage(pairs))
+        result["unbound_kinds"] = unbound_kinds(result["manifest"], [k for k, p in pairs.items() if p["version"] is not None])
+        result["unplaced_assets"] = unplaced_assets(result["manifest"])
+        result["attention"] = [key for key, pair in pairs.items() if pair["attention"]]
+        return result
+
+    @locked
+    def list_sets(self) -> list[dict]:
+        results = []
+        for path in self.root.glob("sets/*/set.json"):
+            item = self.get_set(path.parent.name)
+            results.append({key: item[key] for key in ("id", "name", "created_at")} | {
+                "requested_pairs": item["coverage"]["requested_pairs"],
+                "coverage": {"percent": item["coverage"]["percent"]}, "attention": len(item["attention"])})
+        return sorted(results, key=lambda s: (s["created_at"], s["id"]))
+
+    @locked
+    def set_style_file(self, set_id: str, n: int, asset: str | None = None,
+                       variant: str | None = None) -> tuple[Path, str]:
+        directory = self._set_dir(set_id)
+        item = self._read(directory / "set.json")
+        refs = item["files"]["style"]
+        if asset is not None:
+            key = self._name(asset) + "/" + self._name(variant)
+            refs = item["files"]["pairs"].get(key, {}).get("style", [])
+        ref = next((r for r in refs if r["index"] == n), None)
+        if ref is None:
+            raise FileNotFoundError("Style reference not found.")
+        return self._file(directory / ref["path"]), ref["media_type"]
+
+    @locked
+    def launch_set(self, set_id: str, *, force: bool = False) -> dict:
+        return self._launch_set(set_id, force=force, retry=False)
+
+    @locked
+    def retry_set(self, set_id: str) -> dict:
+        return self._launch_set(set_id, force=False, retry=True)
+
+    def _launch_set(self, set_id: str, *, force: bool, retry: bool) -> dict:
+        from .forge_sets import pair_plan
+        if type(force) is not bool:
+            raise ForgeStoreError("force must be boolean.")
+        directory = self._set_dir(set_id)
+        item = self._read(directory / "set.json")
+        jobs = self.list_jobs(set_id=set_id)
+        known = {spec["asset"] for spec in self.get_catalog()["specs"]}
+        launched, skipped = [], []
+        try:
+            for pair in item["manifest"]["requires"]:
+                asset, variant = self._name(pair["asset"]), self._name(pair["variant"])
+                key = asset + "/" + variant
+                children = [j for j in jobs if (j["asset"], j["variant"]) == (asset, variant)]
+                latest = children[-1] if children else {}
+                reason = None
+                if any(j["state"] not in {"ready", "failed"} for j in children):
+                    reason = "live child job"
+                elif retry and not (latest.get("state") == "failed" or latest.get("attention")):
+                    reason = "not failed or attention"
+                elif not force and self.list_versions(asset, variant, accepted=True):
+                    reason = "accepted version"
+                plan = pair_plan(item["manifest"], pair)
+                if not reason and plan["intent"] == "from_spec" and asset not in known:
+                    reason = "no spec in catalog"
+                if reason:
+                    skipped.append({"asset": asset, "variant": variant, "reason": reason})
+                    continue
+                generate = {"style": plan["style"]}
+                if plan["intent"] == "from_spec":
+                    generate.update(spec_asset=asset, palette_only=plan["palette_only"])
+                else:
+                    generate.update({k: pair[k] for k in ("height_hint", "floor_height") if k in pair})
+                job = self.create_job(asset, variant, {"turntable": pair["turntable"]},
+                                      intent=plan["intent"], generate=generate, set_id=set_id)
+                launched.append({"asset": asset, "variant": variant, "job_id": job["id"]})
+                refs = (item["files"]["pairs"][key]["style"] if "style_refs" in pair else item["files"]["style"])
+                if plan["style"]:
+                    for ref in refs:
+                        self.record_style_ref(job["id"], ref["filename"], ref["media_type"],
+                                              self._file(directory / ref["path"]).read_bytes())
+                if plan["intent"] == "generate":
+                    for source in item["files"]["pairs"][key]["sources"]:
+                        self.record_upload(job["id"], source["filename"], source["media_type"],
+                                           self._file(directory / source["path"]).read_bytes())
+            item["updated_at"] = self._now().isoformat()
+            item["launches"].append({"at": item["updated_at"], "force": force,
+                                     "launched": launched, "skipped": skipped})
+            self._write_json(directory / "set.json", item)
+        except Exception:
+            for child in launched:
+                self.delete_job(child["job_id"])
+            raise
+        return {"launched": launched, "skipped": skipped}
 
     def _variant_dir(self, asset: str, variant: str) -> Path:
         return self.confined(Path("assets") / self._name(asset) / "variants" / self._name(variant))
@@ -438,8 +657,11 @@ class ForgeStore:
     def create_job(self, asset: str, variant: str, params: dict | None = None, *,
                    canonical_views: list[str] | None = None, intent: str = "fresh",
                    parent_job: str | None = None, parent_version: int | None = None,
-                   replacement_views: list[str] | None = None, generate: dict | None = None) -> dict:
+                   replacement_views: list[str] | None = None, generate: dict | None = None,
+                   set_id: str | None = None) -> dict:
         self._variant_dir(asset, variant)
+        if set_id is not None:
+            self._read(self._set_dir(set_id) / "set.json")
         values = self.validate_params(params)
         views = self._views([] if canonical_views is None else canonical_views)
         replacements = self._views([] if replacement_views is None else replacement_views)
@@ -484,6 +706,8 @@ class ForgeStore:
             "created_at": self._now().isoformat(), "updated_at": self._now().isoformat(),
             "error": None, "accepted": False, "notes": [], "lease": None,
         }
+        if set_id is not None:
+            job["set_id"] = set_id
         if intent == "generate":
             job["generate"] = self.validate_generate(generate)
         elif intent == "from_spec":
@@ -518,10 +742,14 @@ class ForgeStore:
         return job
 
     @locked
-    def list_jobs(self, *, state: str | None = None, asset: str | None = None) -> list[dict]:
+    def list_jobs(self, *, state: str | None = None, asset: str | None = None,
+                  set_id: str | None = None) -> list[dict]:
+        if set_id is not None:
+            self._name(set_id)
         jobs = [self._read_job(p) for p in self.root.glob("assets/*/variants/*/jobs/*/job.json")]
         return sorted((j for j in jobs if (state is None or j["state"] == state)
-                       and (asset is None or j["asset"] == asset)), key=lambda j: (j["created_at"], j["id"]))
+                       and (asset is None or j["asset"] == asset)
+                       and (set_id is None or j.get("set_id") == set_id)), key=lambda j: (j["created_at"], j["id"]))
 
     @locked
     def delete_job(self, job_id: str) -> None:
@@ -986,7 +1214,8 @@ class ForgeStore:
                                               "created_at", "accepted", "metrics", "notes", "lineage")} | {"state": "ready", "artifacts": version.get("artifacts", []), "critic": version.get("critic", {"status": "pending"}), "style": version.get("style", version.get("metrics", {}).get("style")),
             "attention": version.get("attention"),
             "policy": {key: version.get("policy", {})[key] for key in ("mode", "action")
-                       if key in version.get("policy", {})}}
+                       if key in version.get("policy", {})}} | (
+                           {"set_id": version["set_id"]} if version.get("set_id") is not None else {})
 
     @locked
     def claim_critic(self) -> dict | None:
@@ -1145,6 +1374,8 @@ class ForgeStore:
             "metrics": {"part_layers": {}, **metrics}, "critic": {"status": "pending"},
             "created_at": self._now().isoformat(), "accepted": False, "notes": [],
         }
+        if job.get("set_id") is not None:
+            version["set_id"] = job["set_id"]
         prepared = {}
         for name, value in (artifacts or {}).items():
             target = self.confined(name)  # Validate the relative artifact name itself.

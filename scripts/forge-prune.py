@@ -210,7 +210,8 @@ def prune(root, *, keep_versions=10, max_age_days=30, apply=False,
                     "style": version.get("style", version.get("metrics", {}).get("style")),
                     "attention": version.get("attention"),
                     "policy": {field: version.get("policy", {})[field] for field in ("mode", "action")
-                               if field in version.get("policy", {})}})
+                               if field in version.get("policy", {})}} |
+                    ({"set_id": version["set_id"]} if version.get("set_id") is not None else {}))
         path = root / "assets" / pair[0] / "variants" / pair[1] / "versions.json"
         indexes.append((path, json.dumps(summaries, indent=2, allow_nan=False).encode()))
     verb = "DELETE" if apply else "WOULD DELETE"

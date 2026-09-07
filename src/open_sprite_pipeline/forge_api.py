@@ -11,16 +11,15 @@ from __future__ import annotations
 import base64
 import binascii
 import hmac
-from io import BytesIO
 import json
 import os
+import re
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
-from PIL import Image, UnidentifiedImageError
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -35,7 +34,7 @@ class ForgeRoute(APIRoute):
             try:
                 return await handler(request)
             except StarletteHTTPException as exc:
-                if exc.status_code == 400 and request.method == "POST" and request.url.path == "/v1/forge/jobs":
+                if exc.status_code == 400 and request.method == "POST" and request.url.path in {"/v1/forge/jobs", "/v1/forge/sets"}:
                     raise HTTPException(422, exc.detail) from exc
                 raise
             except FileNotFoundError as exc:
@@ -137,6 +136,70 @@ class Note(Payload):
     text: str = Field(min_length=1, max_length=10000)
 
 
+class SetLaunch(Payload):
+    force: bool = Field(default=False, strict=True)
+
+
+@forge_router.post("/sets", status_code=201)
+async def create_set(request: Request):
+    async with request.form(max_files=64, max_fields=128) as form:
+        manifests = form.getlist("manifest")
+        if len(manifests) != 1:
+            raise ForgeStoreError("Supply one manifest file or text field.")
+        manifest = manifests[0]
+        if isinstance(manifest, UploadFile):
+            manifest = (await manifest.read()).decode("utf-8")
+        board, pairs = [], {}
+        for field, upload in form.multi_items():
+            if field == "manifest":
+                continue
+            if field == "style[]":
+                destination = board
+            else:
+                match = re.fullmatch(r"pair_(?:style|sources)\[([^\[\]]+)\]\[\]", field)
+                if match is None:
+                    raise ForgeStoreError("Unknown set upload field.")
+                destination = pairs.setdefault(match[1], [])
+            if not isinstance(upload, UploadFile):
+                raise ForgeStoreError("Set images must be uploaded files.")
+            data = await upload.read(20 * 1024 * 1024 + 1)
+            media_type = ForgeStore.validate_image(data)
+            destination.append((upload.filename or "image", media_type, data))
+        return store(request).create_set(manifest, board, pairs)
+
+
+@forge_router.get("/sets")
+def sets(request: Request):
+    return store(request).list_sets()
+
+
+@forge_router.get("/sets/{set_id}")
+def get_set(request: Request, set_id: str):
+    return store(request).get_set(set_id)
+
+
+@forge_router.post("/sets/{set_id}/launch")
+def launch_set(request: Request, set_id: str, body: SetLaunch | None = None):
+    return store(request).launch_set(set_id, force=body.force if body else False)
+
+
+@forge_router.post("/sets/{set_id}/retry")
+def retry_set(request: Request, set_id: str):
+    return store(request).retry_set(set_id)
+
+
+@forge_router.get("/sets/{set_id}/style/{n}")
+def set_style(request: Request, set_id: str, n: int):
+    path, media_type = store(request).set_style_file(set_id, n)
+    return FileResponse(path, media_type=media_type)
+
+
+@forge_router.get("/sets/{set_id}/pairs/{asset}/{variant}/style/{n}")
+def pair_style(request: Request, set_id: str, asset: str, variant: str, n: int):
+    path, media_type = store(request).set_style_file(set_id, n, asset, variant)
+    return FileResponse(path, media_type=media_type)
+
+
 @forge_router.get("/status")
 def status(request: Request):
     return store(request).status()
@@ -169,18 +232,7 @@ async def create_job(request: Request):
         prepared = []
         for upload in files + style_refs:
             data = await upload.read(20 * 1024 * 1024 + 1)
-            if not data or len(data) > 20 * 1024 * 1024:
-                raise ForgeStoreError("Each image must be nonempty and at most 20 MiB.")
-            try:
-                with Image.open(BytesIO(data)) as image:
-                    media_type = Image.MIME.get(image.format)
-                    if image.width * image.height > 36_000_000:
-                        raise ForgeStoreError("Image exceeds 36 million pixels.")
-                    image.verify()
-            except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-                raise ForgeStoreError("Upload is not a supported image.") from exc
-            if media_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-                raise ForgeStoreError("Unsupported image format.")
+            media_type = ForgeStore.validate_image(data)
             prepared.append((upload.filename or "image", media_type, data))
         prepared, prepared_refs = prepared[:len(files)], prepared[len(files):]
         generate = None
@@ -238,11 +290,12 @@ async def create_job(request: Request):
 
 
 @forge_router.get("/jobs")
-def jobs(request: Request, state: str | None = None, asset: str | None = None):
+def jobs(request: Request, state: str | None = None, asset: str | None = None,
+         set_id: str | None = None):
     target = store(request)
     return [{**job, "attention": job.get("attention"),
              "policy": {"mode": target.policy.mode, **job.get("policy", {})}}
-            for job in target.list_jobs(state=state, asset=asset)]
+            for job in target.list_jobs(state=state, asset=asset, set_id=set_id)]
 
 
 @forge_router.get("/jobs/{job_id}")

@@ -603,3 +603,8 @@ the new code is deployed. The operator separately records image rebuild/recreate
 Forge status, host store translation, real bake/restoration, browser job flow,
 and critic inference or a skipped reason. No Docker execution or service install
 is part of the Phase 6 coding session.
+
+Factory F1 adds set manifests, uploaded style boards and pair sources, durable
+set records, child-job launch/retry, and scene-compatible coverage through the
+Forge API. See [Forge sets](SETS.md) for schema, style precedence, endpoints, and
+coverage semantics. Godot library export (F2) and the set UI (F3) follow.

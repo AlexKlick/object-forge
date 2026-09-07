@@ -134,6 +134,24 @@ class StyleWorkerTests(unittest.TestCase):
         self.assertEqual([j['id'] for j in attention['jobs']], [job['id']])
         self.assertIsNone(self.worker.run_next())
 
+    def test_set_palette_only_child_keeps_enforce_policy_hooks(self):
+        self.store.policy = Policy('enforce')
+        self.worker.publish_catalog()
+        response = self.http.post('/v1/forge/sets', data={'manifest':
+            'palette_only: true\nrequires: [{asset: a, variant: v}]'})
+        self.assertEqual(response.status_code, 201, response.text)
+        set_id = response.json()['id']
+        launch = self.http.post(f'/v1/forge/sets/{set_id}/launch')
+        self.assertEqual(launch.status_code, 200, launch.text)
+        child = launch.json()['launched'][0]
+        job = self.worker.run_next()
+        self.assertEqual(job['id'], child['job_id'])
+        self.assertEqual(job['set_id'], set_id)
+        self.assertEqual(job['state'], 'queued_bake')
+        self.assertEqual(job['match']['submitted_by'], 'policy')
+        self.assertEqual(self.store.get_set(set_id)['pairs']['a/v']['policy_mode'], 'enforce')
+        self.assertEqual(self.snapshot(), self.before, 'SPIKE TREE CHANGED')
+
     def test_enforce_palette_only_skips_worker_double_submit(self):
         self.store.policy = Policy('enforce')
         self.create(palette_only='true')
