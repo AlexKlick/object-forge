@@ -107,6 +107,7 @@ class BoardView {
 
   async refreshPickers() {
     [this.assets, this.parents] = await Promise.all([api(`${forge}/assets`), api(`${forge}/library`)]);
+    this.parents = this.parents.filter((v) => v.origin !== "trellis" && v.job_id);
     $("#forgeAssets").innerHTML = [...new Set(this.assets.map((entry) => entry.asset))].map((asset) => `<option value="${esc(asset)}"></option>`).join("");
     this.variants();
     const selected = $("#parentVersion").value;
@@ -397,7 +398,7 @@ class VersionDetail {
     const request = ++this.request;
     const version = await api(versionPath(summary));
     const [job, report, harmonize] = await Promise.all([
-      api(`${forge}/jobs/${version.job_id}`).catch((error) => ({ history_error: error.message })),
+      version.job_id == null ? {} : api(`${forge}/jobs/${version.job_id}`).catch((error) => ({ history_error: error.message })),
       version.artifacts.includes("bake_report.json") ? api(artifactPath(version, "bake_report.json")) : {},
       version.artifacts.includes("harmonize_report.json") ? api(artifactPath(version, "harmonize_report.json")) : {},
     ]);
@@ -411,7 +412,7 @@ class VersionDetail {
     this.version = version; this.job = job; this.report = report; this.harmonize = harmonize; this.chain = chain;
     this.root.hidden = false;
     $(".detail-title", this.root).textContent = `${version.asset} / ${version.variant} · ${lineage(version)}`;
-    $(".detail-actions", this.root).innerHTML = button(version.accepted ? "★ Accepted · unstar" : "☆ Accept", "accept") + button("Iterate", "iterate", "accent") + button("Add note", "note");
+    $(".detail-actions", this.root).innerHTML = button(version.accepted ? "★ Accepted · unstar" : "☆ Accept", "accept") + (version.origin === "trellis" ? "" : button("Iterate", "iterate", "accent")) + button("Add note", "note");
     $(".detail-actions", this.root).onclick = guard(async (event) => {
       const action = event.target.closest("[data-action]")?.dataset.action;
       if (action === "accept") { await api(`${versionPath(version)}/accept`, json({ accepted: !version.accepted })); await this.open(version); await library.refresh(); }
@@ -475,6 +476,10 @@ class VersionDetail {
       const views = [...new Set([...(this.job.canonical_views || []), ...Object.keys(validation), ...Object.keys(drift)])];
       content.innerHTML = `<table><thead><tr><th>View</th><th>Validation IoU</th><th>Harmonize drift</th></tr></thead><tbody>${views.map((view) => `<tr><td>${esc(view)}</td><td>${esc(JSON.stringify(validation[view] ?? "unavailable"))}</td><td>${esc(String(drift[view] ?? "unavailable"))}</td></tr>`).join("")}</tbody></table><details><summary>Harmonize report</summary><pre>${pretty(this.harmonize)}</pre></details>`;
     } else if (name === "History") {
+      if (v.job_id == null) {
+        content.innerHTML = `<p>Created: ${esc(v.created_at)}</p><h4>Generation run</h4><pre>${pretty(v.inputs.run || {})}</pre><h4>Notes</h4>${v.notes.map((note) => `<blockquote><p>${esc(note.text)}</p><small>${esc(note.author)} · ${esc(note.at)}</small></blockquote>`).join("") || "<p>No notes yet.</p>"}`;
+        return;
+      }
       content.innerHTML = `<p class="forge-lineage">${this.chain.map((v) => `v${v.number}`).join(" ← ")} · root v${v.lineage.root_version}</p><p>Created: ${esc(v.created_at)}<br>Job updated: ${esc(this.job.updated_at || "unavailable")}</p>${this.job.history_error ? `<p class="forge-error">Job history unavailable: ${esc(this.job.history_error)}</p>` : ""}<h4>Notes</h4>${[...(this.job.notes || []), ...v.notes].map((note) => `<blockquote><p>${esc(note.text)}</p><small>${esc(note.author)} · ${esc(note.at)}</small></blockquote>`).join("") || "<p>No notes yet.</p>"}<h4>Job decisions and inputs</h4><pre>${pretty({ intent: this.job.intent, decisions: this.job.match?.decisions, inputs: v.inputs })}</pre><h4>Lineage dates</h4><pre>${pretty(this.chain.map((v) => ({ version: v.number, job: v.job_id, created_at: v.created_at })))}</pre>`;
     }
   }
@@ -489,6 +494,7 @@ class VersionDetail {
       ${verdict.excerpt ? `<pre class="critic-excerpt">${esc(verdict.excerpt)}</pre>` : ""}
       <ul class="critic-issues">${(verdict.issues || []).map((issue) => `<li><span class="forge-badge">${issue.frame == null ? "All frames" : `Frame ${esc(issue.frame)}`}</span> <strong>${esc(issue.severity)}</strong> · ${esc(issue.kind)}<p>${esc(issue.note)}</p></li>`).join("")}</ul>
       <footer><small>${esc(verdict.model || "Model pending")} · ${esc(verdict.at || "Not run yet")}</small></footer>`;
+    $("[data-action=rerun-critic]", content).disabled = version.origin === "trellis" && version.job_id == null;
     $("[data-action=rerun-critic]", content).onclick = guard(async (event) => {
       event.currentTarget.disabled = true;
       try {
@@ -509,4 +515,6 @@ class VersionDetail {
 const library = new LibraryView($("#libraryPanel"));
 const detail = new VersionDetail($("#versionDetail"));
 const board = new BoardView($("#forgePanel"));
+// Gen Ladder GL1: the single Capture-to-Library navigation seam.
+document.addEventListener("forge:open-library", () => showTab("library"));
 for (const tab of document.querySelectorAll("[data-main-tab]")) tab.onclick = () => showTab(tab.dataset.mainTab);

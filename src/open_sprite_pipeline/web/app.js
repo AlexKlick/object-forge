@@ -8,6 +8,7 @@ const state = {
   mask: null,
   status: null,
   busy: false,
+  libraryRunKey: null,
 };
 
 const canvas = $("#selectionCanvas");
@@ -117,6 +118,7 @@ function drawCanvas() {
 }
 
 function resetSelection() {
+  configureLibrarySave(null);
   state.points = [];
   state.segment = null;
   state.mask = null;
@@ -295,6 +297,7 @@ async function generateMesh() {
 }
 
 function showFailedResult(record) {
+  configureLibrarySave(null);
   const errors = record.error
     || record.response?.manifest?.items?.[0]?.errors?.join(" · ")
     || "Generation did not return a mesh.";
@@ -309,6 +312,7 @@ async function renderPipelineResult(result) {
     return;
   }
   $("#resultSection").classList.remove("hidden");
+  configureLibrarySave(result);
   $("#downloadMesh").href = result.primary_asset_url;
   setOptionalDownload("#downloadMaterial", result.material_url);
   setOptionalDownload("#downloadTexture", result.texture_url);
@@ -332,6 +336,37 @@ async function renderPipelineResult(result) {
   }
   $("#resultSection").scrollIntoView({ behavior: "smooth", block: "start" });
 }
+
+// Gen Ladder GL1: imports use server-side files, keyed to the displayed run.
+function configureLibrarySave(result) {
+  state.libraryRunKey = result?.status === "success" && result.primary_asset_url ? result.record_key : null;
+  $("#librarySaveForm").classList.toggle("hidden", !state.libraryRunKey);
+  $("#libraryAsset").value = (state.upload?.original_name || "trellis-asset").toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, "-").replace(/\.{2,}/g, "-").replace(/^[^a-z0-9]+/, "").slice(0, 128) || "trellis-asset";
+  $("#libraryVariant").value = "default";
+  $("#saveToLibrary").disabled = false;
+  $("#openSavedLibrary").classList.add("hidden");
+}
+
+$("#librarySaveForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const recordKey = state.libraryRunKey;
+  if (!recordKey || $("#saveToLibrary").disabled) return;
+  $("#saveToLibrary").disabled = true;
+  try {
+    const version = await api(`/v1/ui/runs/${encodeURIComponent(recordKey)}/library`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ asset: $("#libraryAsset").value, variant: $("#libraryVariant").value }),
+    });
+    toast(`Saved to Library · ${version.asset} / ${version.variant} · v${version.number}`);
+    if (state.libraryRunKey === recordKey) $("#openSavedLibrary").classList.remove("hidden");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (state.libraryRunKey === recordKey) $("#saveToLibrary").disabled = false;
+  }
+});
+$("#openSavedLibrary").addEventListener("click", () => document.dispatchEvent(new Event("forge:open-library")));
 
 // --- refresh persistence: restore the latest generation run on page load.
 // The backend records every pipeline run under the (bind-mounted) UI store;

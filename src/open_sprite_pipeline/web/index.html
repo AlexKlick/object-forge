@@ -157,6 +157,16 @@
             <a id="downloadMaterial" class="button secondary hidden" href="#" download>Material</a>
             <a id="downloadTexture" class="button ghost hidden" href="#" download>Texture</a>
           </div>
+          <form id="librarySaveForm" class="hidden">
+            <div class="forge-fields">
+              <label>Asset<input id="libraryAsset" name="asset" class="text-control" required maxlength="128" pattern="[a-z0-9][a-z0-9_.\-]*" /></label>
+              <label>Variant<input id="libraryVariant" name="variant" class="text-control" value="default" required maxlength="128" pattern="[a-z0-9][a-z0-9_.\-]*" /></label>
+            </div>
+            <div class="button-row">
+              <button id="saveToLibrary" class="button accent" type="submit">Save to Library</button>
+              <button id="openSavedLibrary" class="button secondary hidden" type="button">Open Library</button>
+            </div>
+          </form>
           <div id="spriteResult" class="sprite-result hidden">
             <span>Sprite sheet</span><img id="spriteSheet" alt="Generated sprite sheet" />
           </div>

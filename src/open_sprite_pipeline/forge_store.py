@@ -502,7 +502,13 @@ class ForgeStore:
                 continue
             version = self.get_version(summary["asset"], summary["variant"], summary["number"])
             # Version publication precedes job completion. Critic cannot claim in that gap.
-            if self.get_job(version["job_id"])["state"] != "ready":
+            if not version.get("job_id"):
+                continue
+            try:
+                job = self.get_job(version["job_id"])
+            except FileNotFoundError:
+                continue
+            if job["state"] != "ready":
                 continue
             lease = version.get("critic_lease")
             if lease and datetime.fromisoformat(lease["lease_expires_at"]) > now:
@@ -524,6 +530,8 @@ class ForgeStore:
     @locked
     def rerun_critic(self, asset: str, variant: str, number: int) -> dict:
         version = self.get_version(asset, variant, number)
+        if version["origin"] == "trellis" and not version.get("job_id"):
+            return self.get_critic(asset, variant, number)
         version.update(critic={"status": "pending"}, critic_lease=None)
         self._write_json(self._version_dir(asset, variant, number) / "version.json", version)
         self._index(asset, variant)
@@ -644,6 +652,89 @@ class ForgeStore:
         self._index(job["asset"], job["variant"])
         return self.get_version(job["asset"], job["variant"], number)
 
+    @staticmethod
+    def _import_source(source: Path, source_roots: list[Path], max_bytes: int) -> Path:
+        """Gen Ladder GL1: validate the original path before resolving aliases."""
+        source = Path(source)
+        if not source.is_absolute() or ".." in source.parts:
+            raise ForgeStoreError("Import sources must be absolute, confined paths.")
+        if any(p.is_symlink() for p in (source, *source.parents)):
+            raise ForgeStoreError("Symlinks are not allowed in import sources.")
+        resolved = source.resolve()
+        if not any(resolved.is_relative_to(Path(root).resolve()) for root in source_roots):
+            raise ForgeStoreError("Import source escapes the allowed source roots.")
+        if not resolved.is_file():
+            raise ForgeStoreError("Import source must exist and be a regular file.")
+        if resolved.stat().st_size > max_bytes:
+            raise ForgeStoreError(f"Import artifact exceeds {max_bytes} bytes.")
+        return resolved
+
+    @locked
+    def import_version(self, asset: str, variant: str, *, origin: str,
+                       artifacts: list[tuple[str, Path]], source_roots: list[Path],
+                       metrics: dict, inputs: dict, dedupe_key: str,
+                       max_bytes_per_artifact: int = 256 * 1024 * 1024) -> dict:
+        """Gen Ladder GL1: publish a jobless import; keys dedupe across the library."""
+        self._variant_dir(asset, variant)
+        if origin != "trellis" or not isinstance(dedupe_key, str) or not dedupe_key:
+            raise ForgeStoreError("Imports require trellis origin and a nonempty dedupe key.")
+        for summary in self.list_versions():
+            if summary["metrics"].get("import", {}).get("dedupe_key") == dedupe_key:
+                return summary
+        if not isinstance(metrics, dict) or not isinstance(inputs, dict):
+            raise ForgeStoreError("Import metrics and inputs must be objects.")
+        if type(max_bytes_per_artifact) is not int or max_bytes_per_artifact < 1:
+            raise ForgeStoreError("Import size limit must be a positive integer.")
+        metrics = {**deepcopy(metrics), "part_layers": {}}
+        if not isinstance(metrics.get("import", {}), dict):
+            raise ForgeStoreError("Import metrics must be an object.")
+        metrics["import"] = {**metrics.get("import", {}), "dedupe_key": dedupe_key}
+        json.dumps([metrics, inputs], allow_nan=False)
+        prepared = {}
+        for name, source in artifacts:
+            relative = self.confined(name).relative_to(self.root)
+            if relative in prepared or any(relative in p.parents or p in relative.parents for p in prepared):
+                raise ForgeStoreError("Artifact paths must be distinct files.")
+            prepared[relative] = self._import_source(source, source_roots, max_bytes_per_artifact)
+        if not prepared:
+            raise ForgeStoreError("Imports require artifacts.")
+        versions = self._index(asset, variant)
+        number = max((v["number"] for v in versions), default=0) + 1
+        directory = self._version_dir(asset, variant, number)
+        at = self._now().isoformat()
+        version = {
+            "number": number, "asset": asset, "variant": variant, "origin": origin,
+            "job_id": None, "created_at": at, "accepted": False, "notes": [],
+            "lineage": {"parent_version": None, "root_version": number},
+            "inputs": deepcopy(inputs), "metrics": metrics, "critic": {"status": "skipped"},
+            "artifacts": sorted(p.as_posix() for p in prepared),
+        }
+        verdict = {"status": "skipped", "score": None,
+                   "summary": "Imported TRELLIS generation; critic lane does not review imports.",
+                   "model": "none", "issues": [], "at": at}
+        pending = self._checked(directory.with_name(f".pending-{uuid4().hex}"))
+        try:
+            (pending / "artifacts").mkdir(parents=True)
+            for name, source in prepared.items():
+                source = self._import_source(source, source_roots, max_bytes_per_artifact)
+                target = self._checked(pending / "artifacts" / name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, target)
+                except OSError:
+                    shutil.copy2(source, target)
+                if target.stat().st_size > max_bytes_per_artifact:
+                    raise ForgeStoreError("Import artifact grew beyond the size limit.")
+            self._write_json(pending / "critic" / "critic.json", verdict)
+            self._write_json(pending / "version.json", version)
+            # Rename only our pending directory; Capture sources never move.
+            os.replace(pending, directory)
+        finally:
+            if pending.exists():
+                shutil.rmtree(pending)
+        self._index(asset, variant)
+        return self._summary(version)
+
     @locked
     def complete(self, job_id: str, *, artifacts: dict | None = None, metrics: dict | None = None,
                  lease_id: str | None = None) -> dict:
@@ -694,6 +785,8 @@ class ForgeStore:
         version["accepted"] = accepted
         self._write_json(self._version_dir(asset, variant, number) / "version.json", version)
         try:
+            if not version.get("job_id"):
+                raise FileNotFoundError("Imported version has no job.")
             job = self.get_job(version["job_id"])
         except FileNotFoundError:
             pass

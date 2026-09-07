@@ -6,10 +6,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 try:
-    from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+    from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
     from fastapi.responses import FileResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, Field
@@ -48,6 +48,11 @@ class RunRequest(BaseModel):
     parts_hint: int | None = None
     provider: str | None = None
     mock: bool = False
+
+
+class SaveToLibrary(BaseModel):
+    asset: str
+    variant: str
 
 
 class PointRequest(BaseModel):
@@ -171,6 +176,21 @@ def create_app(
         except ValueError as exc:
             raise UiStoreError("Pipeline returned an artifact outside its configured root.") from exc
         return f"/v1/artifacts/{quote(relative.as_posix(), safe='/')}"
+
+    def artifact_path_from_url(url: str) -> Path:
+        """Gen Ladder GL1: inverse of artifact_url, retaining paths for link checks."""
+        parsed = urlsplit(url)
+        prefix = "/v1/artifacts/"
+        if (parsed.scheme or parsed.netloc or parsed.query or parsed.fragment
+                or not parsed.path.startswith(prefix)):
+            raise UiStoreError("Expected a local pipeline artifact URL.")
+        relative = unquote(parsed.path[len(prefix):])
+        if (not relative or Path(relative).is_absolute() or ".." in Path(relative).parts
+                or "\\" in relative or "\x00" in relative):
+            raise UiStoreError("Invalid pipeline artifact URL path.")
+        # Validate confinement/existence using the same path mapper as artifact serving.
+        artifact_path(relative)
+        return artifact_root() / relative
 
     # --- UI run records: generation state that survives a page refresh.
     # Records live under the UI store root (bind-mounted in the container),
@@ -378,6 +398,7 @@ def create_app(
                 "mock": bool(payload.mock),
                 "mode": payload.mode,
                 "provider": payload.provider,
+                "prompt": payload.prompt,
                 "submitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
             _write_run_record(run_record)
@@ -451,6 +472,79 @@ def create_app(
         if record is None:
             raise HTTPException(status_code=404, detail="Unknown run record.")
         return record
+
+    @application.post("/v1/ui/runs/{record_key}/library", status_code=201)
+    def save_run_to_library(record_key: str, body: SaveToLibrary, response: Response) -> dict:
+        """Gen Ladder GL1: 201 on publication, 200 on a library-wide run-key retry."""
+        forge = getattr(application.state, "forge_store", None)
+        if forge is None:
+            raise HTTPException(status_code=503, detail="Forge is disabled.")
+        record = _read_run_record(record_key)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Unknown run record.")
+        result = record.get("response") or {}
+        if record.get("status") != "completed" or not result.get("primary_asset_url"):
+            raise HTTPException(status_code=422, detail="A completed run with a primary asset is required.")
+        from . import forge_glb
+
+        # Serialize lookup + publication so concurrent retries also return 200.
+        with forge._lock:
+            for summary in forge.list_versions():
+                if summary["metrics"].get("import", {}).get("dedupe_key") == record_key:
+                    response.status_code = 200
+                    return summary
+            try:
+                roots = [artifact_root()]
+                limit = 256 * 1024 * 1024
+                glb = forge._import_source(artifact_path_from_url(result["primary_asset_url"]), roots, limit)
+                report = forge_glb.inspect(glb.read_bytes())
+                problems = forge_glb.violations(report)
+                if problems:
+                    raise ValueError("Unusable GLB: " + "; ".join(problems))
+                artifacts = [("model.glb", glb)]
+                manifest = result.get("manifest") or {}
+                item = (manifest.get("items") or [{}])[0]
+                generation = item.get("generation") or {}
+                previews = list(result.get("preview_urls") or [])
+                for url in previews:
+                    if not url or Path(unquote(urlsplit(url).path)).suffix.lower() != ".mp4":
+                        continue
+                    try:
+                        preview = artifact_path_from_url(url)
+                    except FileNotFoundError:
+                        continue
+                    artifacts.append(("preview.mp4", forge._import_source(preview, roots, limit)))
+                    break
+                # Older records retain filesystem preview paths only in the manifest.
+                if len(artifacts) == 1:
+                    for path in generation.get("preview_paths", []):
+                        if not path or Path(path).suffix.lower() != ".mp4":
+                            continue
+                        preview = Path(path)
+                        if not preview.is_absolute():
+                            preview = PROJECT_ROOT / preview
+                        if not preview.exists() and not preview.is_symlink():
+                            continue
+                        artifacts.append(("preview.mp4", forge._import_source(preview, roots, limit)))
+                        break
+                run = {key: record.get(key) or result.get(key) for key in
+                       ("image_id", "segment_id", "provider", "mode", "prompt")}
+                run.update(record_key=record_key, run_id=result.get("run_id") or record.get("run_id") or manifest.get("run_id"))
+                for key in ("provider", "mode", "prompt"):
+                    run[key] = run[key] or generation.get(key) or (manifest.get("request") or {}).get(key) or manifest.get(key)
+                run["provider"] = generation.get("provider_id") or run["provider"] or (item.get("route") or {}).get("provider_id")
+                return forge.import_version(
+                    body.asset, body.variant, origin="trellis", artifacts=artifacts,
+                    source_roots=roots, dedupe_key=record_key,
+                    metrics={"part_layers": {}, "glb": report, "run_id": run["run_id"],
+                             "import": {"dedupe_key": record_key,
+                                        "artifact_bytes": {name: path.stat().st_size for name, path in artifacts},
+                                        "provider": run["provider"], "mode": run["mode"]}},
+                    inputs={"uploads": [], "staged_views": [], "replacement_views": [],
+                            "parent_views_inherited": [], "run": run},
+                )
+            except (ValueError, OSError, TypeError, KeyError, AttributeError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @application.get("/v1/artifacts/{relative_path:path}")
     def pipeline_artifact(relative_path: str) -> FileResponse:

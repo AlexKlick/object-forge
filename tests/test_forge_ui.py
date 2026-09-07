@@ -69,9 +69,33 @@ class ForgeUiTests(unittest.TestCase):
 
     def test_capture_logic_is_byte_identical_after_extraction(self):
         app = (WEB / "app.js").read_text()
+        # Gen Ladder GL1 explicitly adds import controls; keep the original
+        # checksum for every byte outside those additions.
+        start = app.index("// Gen Ladder GL1: imports use server-side files")
+        end = app.index("// --- refresh persistence:", start)
+        app = app[:start] + app[end:]
+        app = app.replace("  libraryRunKey: null,\n", "")
+        app = app.replace("  configureLibrarySave(null);\n", "")
+        app = app.replace("  configureLibrarySave(result);\n", "")
         body = app.removeprefix('import { MeshViewer, loadViewerModules } from "./viewer.js";\n')
         body = body.removesuffix('\nexport { api, toast, escapeHtml };\n')
         self.assertEqual(hashlib.sha256(body.encode()).hexdigest(), "c465501b29c02f07b72f8f36fb2ab0195dbceb01d6bc61a03e78764d021d0fea")
+
+    def test_gen_ladder_gl1_controls_and_single_navigation_seam(self):
+        shell = ShellParser()
+        shell.feed((WEB / "index.html").read_text())
+        for name in ("librarySaveForm", "libraryAsset", "libraryVariant", "saveToLibrary", "openSavedLibrary"):
+            self.assertIn(name, shell.ids)
+        app = (WEB / "app.js").read_text()
+        forge = (WEB / "forge.js").read_text()
+        self.assertIn('/v1/ui/runs/${encodeURIComponent(recordKey)}/library', app)
+        self.assertEqual(app.count('new Event("forge:open-library")'), 1)
+        self.assertEqual(forge.count('document.addEventListener("forge:open-library"'), 1)
+        self.assertNotIn('from "./forge.js"', app)
+        self.assertIn('version.origin === "trellis" ? "" : button("Iterate"', forge)
+        self.assertIn('version.job_id == null ? {} : api(', forge)
+        self.assertIn('if (v.job_id == null)', forge)
+        self.assertIn('pretty(v.inputs.run || {})', forge)
 
     def test_javascript_module_syntax(self):
         self.assertIsNotNone(shutil.which("node"), "Node is required for the static JS syntax gate.")
