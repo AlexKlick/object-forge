@@ -203,6 +203,30 @@ prompt tokens, truncation, crop box, and working sizes. It exits 2 on 503, print
 the server body; other request/input failures exit 1. The first request has a
 30-minute client timeout to allow cold downloads.
 
+## Measured on the first real round (2026-09-07)
+
+`bank_citadel/megabank/front_left` (SE0-B render + depth pass), one mechanical
+reference image, three seeds, `long_side=768` → working size 400×768:
+
+| measurement | value |
+| --- | --- |
+| wall time, cold (model load from cache + 3 renders + encode) | 61 s |
+| torch peak allocated (`peak_mb`) | 3 944 MiB |
+| GPU 1 device peak (1 s `nvidia-smi` sampling) with the 6.7 GB control lane resident | 10 841 MiB of 12 288 |
+| device usage while loaded and idle (weights offloaded to CPU) | +216 MiB over baseline |
+| `free_mb` reported while loaded (cache-aware) | 5 073 MiB → the 4 500 guard still admits |
+| idle unload | observed at ~200 s; device back to baseline (+76 MiB CUDA context) |
+| candidate alpha vs render alpha | byte-identical, all three seeds |
+| `style_check.check_png` | pass, all three |
+| `style_metrics` (repo B) | palette_drift 4.1–6.7, change 7.3–8.0 (identity 0, +6 tint 2.5) |
+| prompt (`style_prompt`, 42 words after the 44-word budget) | 68 CLIP tokens |
+
+Three real-load defects were found and fixed by this round before the first
+successful render: ControlNet needed `variant="fp16"` (cache holds fp16 only),
+diffusers 0.40 removed the pipeline-level VAE slicing wrappers, and attention
+slicing discarded the IP-Adapter attention processors. Each surfaced only under
+a real model — the unit suite cannot see them; keep the smoke in every deploy.
+
 ## Troubleshooting
 
 - `gpu_busy`: inspect status and GPU 1 free memory; wait for other work to release
