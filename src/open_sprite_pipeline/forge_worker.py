@@ -5,7 +5,7 @@ never call its run/main functions, which write beneath the spike assets tree.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from collections import Counter
 import base64
 import fcntl
@@ -28,6 +28,8 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+import yaml
 
 from . import forge_glb
 
@@ -194,9 +196,12 @@ class ForgeWorker:
                 reported, root, exc)
 
     @contextmanager
-    def bake_lock(self, job: dict):
+    def bake_lock(self, job: dict, namespace: str = "spike"):
+        if namespace not in {"spike", "workspace"}:
+            raise ValueError("Invalid bake lock namespace.")
+        suffix = ".workspace" if namespace == "workspace" else ""
         root = self.store_root()
-        path = checked_path(root, f"locks/{job['asset']}__{job['variant']}.lock")
+        path = checked_path(root, f"locks/{job['asset']}__{job['variant']}{suffix}.lock")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+b") as lock:
             try:
@@ -209,22 +214,41 @@ class ForgeWorker:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
+    @staticmethod
+    def generate_family(job: dict) -> bool:
+        return job.get("intent") in {"generate", "iterate_blockout"}
+
+    def workspace_root(self, job: dict) -> Path:
+        root = self.store_root()
+        for key in ("asset", "variant"):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", job[key]) or ".." in job[key]:
+                raise ValueError("Invalid workspace identifier.")
+        ws = checked_path(root, f"assets/{job['asset']}/workspace/{job['variant']}")
+        pair = f"{job['asset']}/{job['variant']}"
+        for directory in ("in", "specs", f"blockouts/{pair}", f"renders/{pair}",
+                          f"styled/{pair}/views", f"bakes/{pair}"):
+            checked_path(root, ws.relative_to(root) / directory).mkdir(parents=True, exist_ok=True)
+        return ws
+
     def run_next(self):
-        job = self.client.request("POST", "/worker/claim", {
-            "kind": "pipeline", "stages": ["matching", "review"]})
-        if job is not None:
-            return self.process(job)
-        for candidate in self.client.request("GET", "/jobs"):
-            if candidate["state"] not in {"queued_bake", "baking"}:
-                continue
-            # Lock BEFORE claiming: a competing process leaves its job queued.
-            with self.bake_lock(candidate) as root:
-                if root is None:
+        # Workspace locks span every generating/staging/baking subprocess. Take
+        # them before claims so a busy workspace never strands a fresh lease.
+        candidates = self.client.request("GET", "/jobs")
+        for stages in (("matching", "review"), ("baking",)):
+            for candidate in candidates:
+                stage = {"uploaded": "matching", "queued_bake": "baking"}.get(candidate["state"], candidate["state"])
+                if stage not in stages:
                     continue
-                job = self.client.request("POST", "/worker/claim", {
-                    "kind": "pipeline", "stages": ["baking"], "job_id": candidate["id"]})
-                if job is not None:
-                    return self.process(job, bake_root=root)
+                workspace = self.generate_family(candidate)
+                lock = (self.bake_lock(candidate, "workspace" if workspace else "spike")
+                        if workspace or stage == "baking" else nullcontext(True))
+                with lock as root:
+                    if root is None:
+                        continue
+                    job = self.client.request("POST", "/worker/claim", {
+                        "kind": "pipeline", "stages": list(stages), "job_id": candidate["id"]})
+                    if job is not None:
+                        return self.process(job, bake_root=root if root is not True else None)
         return None
 
     def init_critic(self):
@@ -264,17 +288,208 @@ class ForgeWorker:
             if result is None:
                 stopped.wait(interval)
 
+    @staticmethod
+    def command_override(override: str, values: dict) -> list[str]:
+        # Tokenize first: spaces or shell metacharacters in paths remain data.
+        # No-placeholder overrides keep exactly the historical argv.
+        result = []
+        for token in shlex.split(override):
+            if token == "{inputs}":
+                result.extend(str(value) for value in values.get("inputs", []))
+                continue
+            for key, value in values.items():
+                if not isinstance(value, list):
+                    token = token.replace("{" + key + "}", str(value))
+            result.append(token)
+        return result
+
     def bake_command(self, job: dict) -> list[str]:
         override = os.getenv("FORGE_BAKE_CMD")
-        if override:
+        if override and not any(key in override for key in ("{assets_root}", "{spec}")):
             return shlex.split(override)
+        ws = self.workspace_root(job) if self.generate_family(job) else self.assets
+        spec = checked_path(ws, f"specs/{job['asset']}.yaml")
+        if override:
+            return self.command_override(override, {"assets_root": ws, "spec": spec})
         command = [os.getenv("FORGE_BAKE_PYTHON", "/home/alexk/.venv/bin/python"),
                    str(checked_path(self.assets, "tools/bake.py")),
                    "--asset", job["asset"], "--variant", job["variant"]]
         for key in ("atlas_tile", "turntable", "ownership_min", "view_iou_warn", "view_iou_fail"):
             if job["params"][key]:
                 command.extend(["--" + key.replace("_", "-"), str(job["params"][key])])
+        if self.generate_family(job):
+            command.extend(["--assets-root", str(ws), "--spec", str(spec)])
+            # Zero staged views is the designed degraded mode for generated
+            # assets (all panels rejected / views missing): bake.py's palette
+            # fallback, exactly like the scene lane's palette-only sets.
+            views = checked_path(ws, f"styled/{job['asset']}/{job['variant']}/views")
+            if not list(views.glob("*.png")):
+                command.append("--allow-palette-only")
         return command
+
+    def run_workspace_command(self, job: dict, command: list[str], label: str):
+        ws = self.workspace_root(job)
+        # Both tools traverse their output roots. Check all existing descendants
+        # before launch, including hardlinks, and again before harvesting.
+        for path in ws.rglob("*"):
+            checked_path(ws, path.relative_to(ws))
+        log = checked_path(ws, f"{label}.log")
+        with log.open("wb") as output:
+            process = subprocess.Popen(command, cwd=ws, stdout=output, stderr=subprocess.STDOUT,
+                                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, start_new_session=True)
+            try:
+                code = process.wait()
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+        self.progress(job, f"{label.upper()} exited rc={code}")
+        if code:
+            raise ValueError(f"{label} failed with rc={code}; log={log}")
+        for path in ws.rglob("*"):
+            checked_path(ws, path.relative_to(ws))
+
+    def synth_command(self, job: dict, inputs: list[str], out: Path, report: Path):
+        settings = job["generate"]
+        values = {"inputs": inputs, "asset": job["asset"], "out": out,
+                  "height_hint": settings["height_hint"], "floor_height": settings["floor_height"], "report": report}
+        override = os.getenv("FORGE_SYNTH_CMD")
+        if override:
+            return self.command_override(override, values)
+        return [os.getenv("FORGE_BAKE_PYTHON", "/home/alexk/.venv/bin/python"),
+                str(checked_path(self.assets, "tools/spec_synth.py")), *inputs,
+                "--asset", job["asset"], "--out", str(out), "--height-hint", str(settings["height_hint"]),
+                "--floor-height", str(settings["floor_height"]), "--report", str(report)]
+
+    def sources(self, job: dict):
+        for upload in job["uploads"]:
+            yield f"u{upload['index']}", f"uploads/{upload['index']}", {"upload_index": upload["index"]}
+        for index, _ in enumerate(job.get("generate", {}).get("segment_refs", [])):
+            yield f"c{index}", f"cutouts/{index}.png", {"cutout_index": index}
+
+    def process_generate(self, job: dict) -> dict:
+        ws = self.workspace_root(job)
+        base = f"/jobs/{job['id']}"
+        inputs = []
+        for name, route, metadata in self.sources(job):
+            data = self.client.request("GET", base + "/" + route)
+            image = self.matcher.load_image(BytesIO(data))
+            if "upload_index" in metadata:
+                image.putalpha(self.matcher.match_mask(image, self.matcher.background_color(image)))
+                data = png(image)
+            target = checked_path(ws, f"in/{name}.png")
+            target.write_bytes(data)  # Always copy; never link into input stores.
+            inputs.extend(["--image", str(target)])
+        count = len(inputs) // 2
+        if not 1 <= count <= 7:
+            raise ValueError("spec_synth requires one to seven inputs; none may be silently dropped.")
+        if count == 1:
+            inputs.append("--force-single")
+        settings = job["generate"]
+        if settings.get("tower_override") == "none":
+            inputs.extend(["--override", "tower=none"])
+        spec_path = checked_path(ws, f"specs/{job['asset']}.yaml")
+        report_path = checked_path(ws, "synth_report.json")
+        # No stale success on an override that exits without producing output.
+        spec_path.unlink(missing_ok=True)
+        report_path.unlink(missing_ok=True)
+        self.run_workspace_command(job, self.synth_command(job, inputs, spec_path, report_path), "synth")
+        report = json.loads(report_path.read_bytes())
+        edit = {}
+        if isinstance(settings.get("tower_override"), dict):
+            edit["tower"] = settings["tower_override"]
+        if settings.get("palette_hex"):
+            edit["palette"] = {role: color.lstrip("#") for role, color in settings["palette_hex"].items()}
+        if edit:
+            edited = checked_path(ws, f"specs/{job['asset']}.edited.yaml")
+            edit_report = checked_path(ws, "synth_edit_report.json")
+            edited.unlink(missing_ok=True)
+            edit_report.unlink(missing_ok=True)
+            self.run_workspace_command(job, self.synth_command(job,
+                ["--edit-in", str(spec_path), "--edit", json.dumps(edit, allow_nan=False)], edited, edit_report), "synth-edit")
+            spec_path.write_bytes(edited.read_bytes())
+            report["edit"] = json.loads(edit_report.read_bytes())
+            report["assumptions"].append("Operator overrides applied after photo synthesis; confidence describes photo inference.")
+        spec = yaml.safe_load(spec_path.read_bytes())
+        if spec["asset"] != job["asset"] or len(spec["views"]) != 5:
+            raise ValueError("Generated spec must identify this asset and five canonical views.")
+        views = sorted(spec["views"])
+        if any(not re.fullmatch(r"[A-Za-z0-9_]+", view) for view in views):
+            raise ValueError("Unsafe canonical view name.")
+        # spec_synth owns the default geometry; an empty alias supports the UI's
+        # named variant without changing massing or the companion source tree.
+        spec["variants"][job["variant"]] = {}
+        spec_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+        report_path.write_text(json.dumps(report, allow_nan=False, indent=2))
+        default_renders = checked_path(ws, f"renders/{job['asset']}/default")
+        default_renders.mkdir(parents=True, exist_ok=True)
+        for path in default_renders.glob("*.png"):
+            checked_path(ws, path.relative_to(ws)).unlink()
+        override = os.getenv("FORGE_BLOCKOUT_CMD")
+        command = (self.command_override(override, {"spec": spec_path, "out": ws}) if override else
+                   [os.getenv("FORGE_BAKE_PYTHON", "/home/alexk/.venv/bin/python"),
+                    str(checked_path(self.assets, "tools/blockout.py")), "--spec", str(spec_path),
+                    "--variant", "default", "--out", str(ws), "--views", "all"])
+        self.run_workspace_command(job, command, "blockout")
+        renders = {}
+        for view in views:
+            renders[view] = checked_path(ws, f"renders/{job['asset']}/default/{view}.png").read_bytes()
+        directory = checked_path(ws, f"renders/{job['asset']}/{job['variant']}")
+        for path in directory.glob("*.png"):
+            checked_path(ws, path.relative_to(ws)).unlink()
+        for view, data in renders.items():
+            checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(data)
+        lease = job["lease"]["lease_id"]
+        self.client.request("PATCH", base, {"canonical_views": views, "lease_id": lease})
+        for view, data in renders.items():
+            self.client.request("POST", base + f"/renders/{view}.png", data, lease=lease)
+        massing = spec["massing"]
+        tower = massing.get("tower")
+        if tower and not tower.get("enabled", False):
+            tower = None
+        plinth = massing["plinth"]
+        payload = {"params": {"footprint": massing["footprint"],
+                    "height": plinth["floors"] * plinth["floor_height"] + (tower["floors"] * tower["floor_height"] if tower else 0),
+                    "plinth": {key: plinth[key] for key in ("floors", "floor_height")},
+                    "tower": {key: tower[key] for key in ("width", "floors", "location")} if tower else None},
+                   "palette": {role: {"hex": color["hex"]} for role, color in spec["palette"].items()},
+                   "confidence": report["confidence"], "assumptions": report["assumptions"],
+                   "next_view": report["next_view"], "synth_report": report, "views": views}
+        self.client.request("POST", base + "/blockout", {"blockout": payload, "lease_id": lease,
+            "artifact": {"encoding": "base64", "data": base64.b64encode(spec_path.read_bytes()).decode("ascii")}})
+        return self.render_masks(job, ws / "renders")
+
+    def restore_workspace(self, job: dict, *, staged=False):
+        # Another job for this pair may have used the shared workspace while the
+        # operator reviewed this one. Restore this job's API-owned bytes first.
+        ws = self.workspace_root(job)
+        base = f"/jobs/{job['id']}"
+        checked_path(ws, f"specs/{job['asset']}.yaml").write_bytes(
+            self.client.request("GET", base + "/blockout/spec.yaml"))
+        directory = checked_path(ws, f"renders/{job['asset']}/{job['variant']}")
+        for path in directory.glob("*.png"):
+            checked_path(ws, path.relative_to(ws)).unlink()
+        for view in job["canonical_views"]:
+            checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(
+                self.client.request("GET", base + f"/renders/{view}.png"))
+        if staged:
+            self.copy_workspace_views(job)
+        return ws
+
+    def copy_workspace_views(self, job: dict):
+        ws = self.workspace_root(job)
+        directory = checked_path(ws, f"styled/{job['asset']}/{job['variant']}/views")
+        views = sorted({p["view"] for p in job["match"]["decisions"] if p["decision"] != "reject"}
+                       | set(job.get("inputs", {}).get("parent_views_inherited", [])))
+        payloads = {view: self.client.request("GET", f"/jobs/{job['id']}/staged/views/{view}.png") for view in views}
+        for path in directory.glob("*.png"):
+            checked_path(ws, path.relative_to(ws)).unlink()
+        for view, data in payloads.items():
+            checked_path(ws, directory.relative_to(ws) / f"{view}.png").write_bytes(data)
 
     def restore_snapshot(self, backup: Path, views: Path, plan: Path):
         manifest = json.loads(checked_path(backup, "snapshot.json").read_bytes())
@@ -353,11 +568,12 @@ class ForgeWorker:
             self.progress(job, "RESTORE views and build_plan snapshot verified")
 
     def execute_bake(self, job: dict, backup: Path):
-        output = checked_path(self.assets, Path("bakes") / job["asset"] / job["variant"])
+        target = self.workspace_root(job) if self.generate_family(job) else self.assets
+        output = checked_path(target, Path("bakes") / job["asset"] / job["variant"])
         # The fixed-path tool also writes here; reject aliases before launching it.
         for path in output.rglob("*"):
-            checked_path(self.assets, path.relative_to(self.assets))
-        log = checked_path(self.assets, output.relative_to(self.assets) / "blender.log")
+            checked_path(target, path.relative_to(target))
+        log = checked_path(target, output.relative_to(target) / "blender.log")
         previous = {p.relative_to(output).as_posix(): fingerprint(p) for p in output.rglob("*") if p.is_file()}
         seen = ""
         pending = ""
@@ -366,7 +582,7 @@ class ForgeWorker:
             nonlocal seen, pending
             if fingerprint(log) == previous.get("blender.log") or not log.exists():
                 return
-            checked_path(self.assets, log.relative_to(self.assets))
+            checked_path(target, log.relative_to(target))
             content = log.read_text(errors="replace")
             if not content.startswith(seen):
                 seen, pending = "", ""
@@ -409,7 +625,7 @@ class ForgeWorker:
         artifacts = {}
         raw = {}
         for name in names + frames:
-            path = checked_path(self.assets, output.relative_to(self.assets) / name)
+            path = checked_path(target, output.relative_to(target) / name)
             if fingerprint(path) is None or fingerprint(path) == previous.get(name):
                 raise ValueError(f"Missing or stale bake artifact: {name}")
             raw[name] = path.read_bytes()
@@ -446,6 +662,11 @@ class ForgeWorker:
         self.progress(job, f"GLB-CHECK ok textured={metrics['glb']['textured']} "
                            f"uv_sets={metrics['glb']['uv_sets']} "
                            f"alpha={','.join(metrics['glb']['alpha_modes']) or 'none'}")
+        if self.generate_family(job):
+            data = checked_path(target, f"specs/{job['asset']}.yaml").read_bytes()
+            artifacts["blockout/spec.yaml"] = {"encoding": "base64", "data": base64.b64encode(data).decode("ascii")}
+            blockout = job["generate"]["blockout"]
+            metrics["synth"] = {"confidence": blockout["confidence"], "params": blockout["params"]}
         return artifacts, metrics
 
     def progress(self, job: dict, *markers: str, **fields):
@@ -477,15 +698,13 @@ class ForgeWorker:
         if errors:
             raise errors[0]
 
-    def render_masks(self, job: dict) -> dict:
-        directory = (self.assets / "renders" / job["asset"] / job["variant"]).resolve()
-        if not directory.is_relative_to(self.assets):
-            raise ValueError("Render directory escapes spike assets.")
+    def render_masks(self, job: dict, renders_root: Path | None = None) -> dict:
+        root = self.assets if renders_root is None else self.workspace_root(job)
+        renders = root / "renders" if renders_root is None else renders_root
+        directory = checked_path(root, renders.relative_to(root) / job["asset"] / job["variant"])
         masks = {}
         for path in sorted(directory.glob("*.png")):
-            if not path.resolve().is_relative_to(self.assets):
-                raise ValueError("Render image escapes spike assets.")
-            image = self.matcher.load_image(path)
+            image = self.matcher.load_image(checked_path(root, path.relative_to(root)))
             masks[path.stem] = self.matcher.object_mask(image, self.matcher.background_color(image))
         if not masks:
             raise ValueError(f"No canonical renders for {job['asset']}/{job['variant']}")
@@ -497,8 +716,8 @@ class ForgeWorker:
         lease = job["lease"]["lease_id"]
         self.client.request("PATCH", base, {"canonical_views": list(masks), "lease_id": lease})
         panels = []
-        for upload in job["uploads"]:
-            image = tool.load_image(BytesIO(self.client.request("GET", base + f"/uploads/{upload['index']}")))
+        for name, route, metadata in self.sources(job):
+            image = tool.load_image(BytesIO(self.client.request("GET", base + "/" + route)))
             bg = tool.background_color(image)
             detection = tool.object_mask(image, bg)
             mask = tool.match_mask(image, bg)
@@ -512,7 +731,7 @@ class ForgeWorker:
                 b != outer and outer[0] <= b[0] and outer[1] <= b[1]
                 and outer[2] >= b[2] and outer[3] >= b[3] for outer in boxes)]
             for index, bbox in enumerate(boxes):
-                panels.append({"panel_id": f"u{upload['index']}-p{index}", "upload_index": upload["index"],
+                panels.append({"panel_id": f"{name}-p{index}", **metadata,
                                "bbox": list(bbox), "rgba": rgba.crop(bbox), "mask": mask.crop(bbox)})
         self.progress(job, f"MATCH panels={len(panels)}")
         accepted, rejects = tool.match_panels([p["mask"] for p in panels], masks,
@@ -563,8 +782,8 @@ class ForgeWorker:
             self.progress(job, f"VIEW {view} iou={score:.4f} staged decision={decision['decision']}")
 
     def process(self, job: dict, *, bake_root: Path | None = None):
-        if job["state"] == "baking" and bake_root is None:
-            with self.bake_lock(job) as root:
+        if (job["state"] == "baking" or self.generate_family(job)) and bake_root is None:
+            with self.bake_lock(job, "workspace" if self.generate_family(job) else "spike") as root:
                 if root is None:
                     return None
                 return self.process(job, bake_root=root)
@@ -573,8 +792,16 @@ class ForgeWorker:
                 return self.process_match(job)
             with self.heartbeats(job):
                 self.progress(job, f"START baking job={job['id']}")
-                with self.staged_snapshot(job, bake_root) as backup:
-                    artifacts, metrics = self.execute_bake(job, backup)
+                if self.generate_family(job):
+                    ws = self.restore_workspace(job, staged=True)
+                    for path in ws.rglob("*"):
+                        checked_path(ws, path.relative_to(ws))
+                    if not list(checked_path(ws, f"styled/{job['asset']}/{job['variant']}/views").glob("*.png")):
+                        self.progress(job, "NO staged views — palette-only degraded bake")
+                    artifacts, metrics = self.execute_bake(job, ws)
+                else:
+                    with self.staged_snapshot(job, bake_root) as backup:
+                        artifacts, metrics = self.execute_bake(job, backup)
             version = self.client.request("POST", "/worker/complete", {
                 "job_id": job["id"], "lease_id": job["lease"]["lease_id"],
                 "artifacts": artifacts, "metrics": metrics})
@@ -597,7 +824,14 @@ class ForgeWorker:
         with self.heartbeats(job):
             self.progress(job, f"START {job['state']} job={job['id']}")
             empty_iteration = job["parent_job"] and not job["uploads"]
-            masks = None if empty_iteration else self.render_masks(job)
+            if self.generate_family(job):
+                if job["state"] == "matching":
+                    masks = self.process_generate(job)
+                else:
+                    ws = self.restore_workspace(job)
+                    masks = self.render_masks(job, ws / "renders")
+            else:
+                masks = None if empty_iteration else self.render_masks(job)
             if job["state"] == "matching":
                 if empty_iteration:
                     missing = sorted(set(job["canonical_views"]) - set(job["inputs"]["parent_views_inherited"]))
@@ -607,6 +841,8 @@ class ForgeWorker:
                     report = self.match(job, masks)
             else:
                 self.materialize(job, masks)
+                if self.generate_family(job):
+                    self.copy_workspace_views(job)
         # Stop heartbeats before finalization clears the lease.
         body = {"lease_id": job["lease"]["lease_id"]}
         if job["state"] == "matching":

@@ -141,7 +141,7 @@ def assets(request: Request):
 async def create_job(request: Request):
     async with request.form(max_files=8, max_fields=16) as form:
         files = form.getlist("files") + form.getlist("files[]")
-        minimum = 0 if form.get("intent") == "iterate_params" else 1
+        minimum = 0 if form.get("intent") in {"iterate_params", "generate"} else 1
         if not minimum <= len(files) <= 8 or not all(isinstance(f, UploadFile) for f in files):
             raise HTTPException(422, "Upload between one and eight images.")
         params = json.loads(form.get("params", "{}"))
@@ -169,6 +169,18 @@ async def create_job(request: Request):
             if media_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
                 raise ForgeStoreError("Unsupported image format.")
             prepared.append((upload.filename or "image", media_type, data))
+        generate = None
+        if form.get("intent") == "generate":
+            generate = store(request).validate_generate({
+                "segment_refs": json.loads(form.get("segment_refs", "[]")),
+                "height_hint": float(form.get("height_hint", "12")),
+                "floor_height": float(form.get("floor_height", "3")),
+            })
+            count = len(files) + len(generate["segment_refs"])
+            if not 1 <= count <= 7:
+                raise ForgeStoreError("Generate requires one to seven total images/cutouts (spec_synth limit).")
+        elif any(key in form for key in ("segment_refs", "height_hint", "floor_height")):
+            raise ForgeStoreError("Generate fields require generate intent.")
         target = store(request)
         # Keep a job invisible to concurrent claims until every upload is stored.
         with target._lock:
@@ -177,7 +189,7 @@ async def create_job(request: Request):
                 canonical_views=canonical, intent=form.get("intent", "fresh"),
                 parent_job=form.get("parent_job"),
                 parent_version=int(parent_version) if parent_version is not None else None,
-                replacement_views=replacements,
+                replacement_views=replacements, generate=generate,
             )
             try:
                 for filename, media_type, data in prepared:
@@ -208,6 +220,65 @@ def delete_job(request: Request, job_id: str):
 def upload(request: Request, job_id: str, index: int):
     path, media_type = store(request).upload_file(job_id, index)
     return FileResponse(path, media_type=media_type)
+
+
+class BlockoutComplete(Payload):
+    blockout: dict[str, Any]
+    lease_id: str
+    artifact: dict[str, str]
+
+
+@forge_router.get("/jobs/{job_id}/cutouts/{index}.png")
+def cutout(request: Request, job_id: str, index: int):
+    job = store(request).get_job(job_id)
+    refs = job.get("generate", {}).get("segment_refs", [])
+    if not 0 <= index < len(refs):
+        raise FileNotFoundError("Cutout reference not found.")
+    ref = refs[index]
+    return FileResponse(request.app.state.store.segment_file(
+        ref["image_id"], ref["segment_id"], "cutout"), media_type="image/png")
+
+
+@forge_router.get("/jobs/{job_id}/renders/{view}.png")
+def read_render(request: Request, job_id: str, view: str):
+    return FileResponse(store(request).blockout_file(job_id, f"renders/{view}.png"), media_type="image/png")
+
+
+@forge_router.post("/jobs/{job_id}/renders/{view}.png", dependencies=[Depends(worker_auth)])
+async def write_render(request: Request, job_id: str, view: str):
+    payload, lease = await worker_image(request)
+    store(request).worker_render(job_id, view, payload, lease)
+    return {"view": view}
+
+
+@forge_router.get("/jobs/{job_id}/blockout")
+def read_blockout(request: Request, job_id: str):
+    payload = store(request).get_job(job_id).get("generate", {}).get("blockout")
+    if payload is None:
+        raise FileNotFoundError("Blockout not available.")
+    return payload
+
+
+@forge_router.get("/jobs/{job_id}/blockout/spec.yaml")
+def read_blockout_spec(request: Request, job_id: str):
+    return FileResponse(store(request).blockout_file(job_id, "spec.yaml"), media_type="application/yaml")
+
+
+@forge_router.post("/jobs/{job_id}/blockout", dependencies=[Depends(worker_auth)])
+def write_blockout(request: Request, job_id: str, body: BlockoutComplete):
+    artifact = body.artifact
+    if set(artifact) != {"encoding", "data"} or artifact["encoding"] != "base64" or len(artifact["data"]) > 3 * 1024 * 1024:
+        raise ForgeStoreError("Spec artifact must be a base64 blob of at most 2 MiB.")
+    try:
+        data = base64.b64decode(artifact["data"], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ForgeStoreError("Invalid spec artifact base64.") from exc
+    return store(request).worker_blockout(job_id, {**body.blockout, "spec_yaml": data}, {}, body.lease_id)
+
+
+@forge_router.post("/jobs/{job_id}/blockout/regenerate")
+def regenerate(request: Request, job_id: str, body: dict[str, Any]):
+    return store(request).regenerate_blockout(job_id, body)
 
 
 @forge_router.get("/jobs/{job_id}/panels/{panel_id}")

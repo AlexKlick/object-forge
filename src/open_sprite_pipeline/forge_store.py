@@ -149,18 +149,166 @@ class ForgeStore:
             raise ForgeStoreError("Views must be unique.")
         return list(values)
 
+    @staticmethod
+    def _positive(value, name, maximum):
+        if type(value) not in (int, float) or not math.isfinite(value) or not 1 <= value <= maximum:
+            raise ForgeStoreError(f"{name} must be finite and between 1 and {maximum}.")
+        return value
+
+    def validate_generate(self, value):
+        value = {} if value is None else value
+        if not isinstance(value, dict) or set(value) - {"segment_refs", "height_hint", "floor_height", "blockout", "regenerations"}:
+            raise ForgeStoreError("Invalid generate settings.")
+        if value.get("blockout") is not None or type(value.get("regenerations", 0)) is not int or value.get("regenerations", 0) != 0:
+            raise ForgeStoreError("New generate jobs cannot supply blockouts or regenerations.")
+        refs = value.get("segment_refs", [])
+        if not isinstance(refs, list) or len(refs) > 8:
+            raise ForgeStoreError("segment_refs must contain zero to eight references.")
+        for ref in refs:
+            if not isinstance(ref, dict) or set(ref) != {"image_id", "segment_id"}:
+                raise ForgeStoreError("Each segment reference requires image_id and segment_id.")
+            for identifier in ref.values():
+                self._name(identifier)
+        return {"segment_refs": deepcopy(refs),
+                "height_hint": self._positive(value.get("height_hint", 12.0), "height_hint", 300),
+                "floor_height": self._positive(value.get("floor_height", 3.0), "floor_height", 10),
+                "blockout": None, "regenerations": 0}
+
+    @locked
+    def regenerate_blockout(self, job_id: str, hints: dict) -> dict:
+        job = self.get_job(job_id)
+        if job["intent"] != "generate" or job["state"] != "review" or job["match"].get("submitted"):
+            raise ForgeConflict("Regeneration requires an unsubmitted generate review.")
+        generate = job["generate"]
+        if generate["regenerations"] >= 8:
+            raise ForgeConflict("At most eight regenerations are allowed.")
+        if not isinstance(hints, dict) or set(hints) - {"height_hint", "floor_height", "tower_override", "palette_hex"}:
+            raise ForgeStoreError("Invalid regeneration hints.")
+        for key, maximum in (("height_hint", 300), ("floor_height", 10)):
+            if key in hints:
+                self._positive(hints[key], key, maximum)
+        tower = hints.get("tower_override", "keep")
+        if isinstance(tower, dict):
+            if set(tower) - {"width", "location"}:
+                raise ForgeStoreError("Invalid tower override.")
+            width = tower.get("width", 1)
+            if type(width) not in (int, float) or not math.isfinite(width) or width <= 0:
+                raise ForgeStoreError("Tower width must be positive and finite.")
+            if tower.get("location", "center") not in {"center", "rear_center", "front_center"}:
+                raise ForgeStoreError("Invalid tower location.")
+        elif tower not in ("none", "keep"):
+            raise ForgeStoreError("Invalid tower override.")
+        palette = hints.get("palette_hex", {})
+        if not isinstance(palette, dict):
+            raise ForgeStoreError("palette_hex must map palette roles to hex colors.")
+        roles = (generate.get("blockout") or {}).get("palette", {})
+        for role, color in palette.items():
+            if role not in roles or not isinstance(color, str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", color):
+                raise ForgeStoreError("Invalid palette role or hex color.")
+        # Merge individual palette edits so changing height does not discard them.
+        palette = {**generate.get("palette_hex", {}), **palette}
+        generate.update(deepcopy(hints))
+        if palette:
+            generate["palette_hex"] = palette
+        generate["regenerations"] += 1
+        generate["blockout"] = None
+        job["match"] = {"panels": [], "decisions": [], "views_missing": []}
+        job.update(state="matching", lease=None, error=None)
+        return self._save_job(job)
+
+    @locked
+    def worker_render(self, job_id: str, view: str, payload: bytes, lease_id: str):
+        job = self._worker_job(job_id, lease_id, "matching")
+        if job["intent"] != "generate" or view not in job["canonical_views"]:
+            raise ForgeConflict("Renders require a canonical generate view.")
+        self._write_bytes(self._job_path(job_id).parent / "renders" / f"{self._name(view)}.png", payload)
+
+    @locked
+    def worker_blockout(self, job_id: str, payload: dict, renders: dict[str, bytes], lease_id: str):
+        job = self._worker_job(job_id, lease_id, "matching")
+        if job["intent"] != "generate":
+            raise ForgeConflict("Blockouts require generate intent.")
+        required = {"params", "palette", "confidence", "assumptions", "next_view", "synth_report", "views", "spec_yaml"}
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise ForgeStoreError("Invalid blockout payload fields.")
+        data = payload["spec_yaml"]
+        if not isinstance(data, bytes) or not data or len(data) > 2 * 1024 * 1024:
+            raise ForgeStoreError("Blockout spec must contain at most 2 MiB of bytes.")
+        public = {key: value for key, value in payload.items() if key != "spec_yaml"}
+        if any(not isinstance(public[key], dict) for key in ("params", "palette", "confidence", "synth_report")):
+            raise ForgeStoreError("Invalid blockout objects.")
+        params = public["params"]
+        if set(params) != {"footprint", "height", "plinth", "tower"}:
+            raise ForgeStoreError("Invalid blockout params.")
+        for section, keys in ((params["footprint"], ("width", "depth")), (params["plinth"], ("floors", "floor_height"))):
+            if not isinstance(section, dict) or set(section) != set(keys):
+                raise ForgeStoreError("Invalid blockout geometry.")
+            for key in keys:
+                value = section[key]
+                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                    raise ForgeStoreError("Blockout dimensions must be positive and finite.")
+        if type(params["height"]) not in (int, float) or not math.isfinite(params["height"]) or params["height"] <= 0:
+            raise ForgeStoreError("Invalid blockout height.")
+        tower = params["tower"]
+        if tower is not None:
+            if not isinstance(tower, dict) or set(tower) != {"width", "floors", "location"}:
+                raise ForgeStoreError("Invalid blockout tower.")
+            for key in ("width", "floors"):
+                if type(tower[key]) not in (int, float) or not math.isfinite(tower[key]) or tower[key] <= 0:
+                    raise ForgeStoreError("Invalid blockout tower dimension.")
+            if tower["location"] not in {"center", "front_center", "rear_center"}:
+                raise ForgeStoreError("Invalid blockout tower location.")
+        if not isinstance(public["assumptions"], list) or any(not isinstance(a, str) for a in public["assumptions"]) or not isinstance(public["next_view"], str):
+            raise ForgeStoreError("Invalid blockout guidance.")
+        for role, color in public["palette"].items():
+            self._name(role)
+            if not isinstance(color, dict) or set(color) != {"hex"} or not isinstance(color["hex"], str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", color["hex"]):
+                raise ForgeStoreError("Invalid blockout palette.")
+        views = self._views(public["views"])
+        if not views or views != job["canonical_views"] or set(renders) - set(views):
+            raise ForgeStoreError("Blockout views must match canonical views.")
+        json.dumps(public, allow_nan=False)
+        for view in views:
+            if view in renders:
+                if not isinstance(renders[view], bytes):
+                    raise ForgeStoreError("Render must be bytes.")
+                self.confined(self._job_path(job_id).parent.relative_to(self.root) / "renders" / f"{view}.png")
+            else:
+                self.blockout_file(job_id, f"renders/{view}.png")
+        for view, image in renders.items():
+            self.worker_render(job_id, view, image, lease_id)
+        self._write_bytes(self._job_path(job_id).parent / "blockout/spec.yaml", data)
+        job["generate"]["blockout"] = deepcopy(public)
+        return self._save_job(job)
+
+    @locked
+    def blockout_file(self, job_id: str, name: str) -> Path:
+        job = self.get_job(job_id)
+        if job["intent"] != "generate":
+            raise FileNotFoundError("No blockout for this job.")
+        if name == "spec.yaml":
+            relative = "blockout/spec.yaml"
+        elif name.startswith("renders/") and name.endswith(".png"):
+            view = self._name(name[len("renders/"):-4])
+            if view not in job["canonical_views"]:
+                raise FileNotFoundError("Unknown render.")
+            relative = name
+        else:
+            raise ForgeStoreError("Invalid blockout artifact.")
+        return self._file(self._job_path(job_id).parent / relative)
+
     @locked
     def create_job(self, asset: str, variant: str, params: dict | None = None, *,
                    canonical_views: list[str] | None = None, intent: str = "fresh",
                    parent_job: str | None = None, parent_version: int | None = None,
-                   replacement_views: list[str] | None = None) -> dict:
+                   replacement_views: list[str] | None = None, generate: dict | None = None) -> dict:
         self._variant_dir(asset, variant)
         values = self.validate_params(params)
         views = self._views([] if canonical_views is None else canonical_views)
         replacements = self._views([] if replacement_views is None else replacement_views)
-        if intent not in {"fresh", "iterate_views", "iterate_params"}:
+        if intent not in {"fresh", "iterate_views", "iterate_params", "generate"}:
             raise ForgeStoreError("Invalid intent.")
-        if intent == "fresh":
+        if intent in {"fresh", "generate"}:
             if parent_job is not None or parent_version is not None or replacements:
                 raise ForgeStoreError("Fresh jobs cannot have parents or replacement views.")
         else:
@@ -173,7 +321,7 @@ class ForgeStore:
             if canonical_views is None:
                 views = parent["canonical_views"]
         inherited = []
-        if intent != "fresh":
+        if intent not in {"fresh", "generate"}:
             if views != parent["canonical_views"]:
                 raise ForgeStoreError("Iteration must preserve parent canonical views.")
             inherited = version["inputs"]["staged_views"]
@@ -191,6 +339,10 @@ class ForgeStore:
             "created_at": self._now().isoformat(), "updated_at": self._now().isoformat(),
             "error": None, "accepted": False, "notes": [], "lease": None,
         }
+        if intent == "generate":
+            job["generate"] = self.validate_generate(generate)
+        elif generate is not None:
+            raise ForgeStoreError("Generate settings require generate intent.")
         return self._save_job(job)
 
     @locked

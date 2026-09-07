@@ -59,6 +59,7 @@ class BoardView {
   constructor(root) {
     this.root = root;
     this.files = [];
+    this.segmentRefs = new Map();
     this.replacements = new Map();
     this.slots = [];
     this.parents = [];
@@ -69,6 +70,13 @@ class BoardView {
         <div class="forge-fields"><label>Asset<input name="asset" required class="text-control" list="forgeAssets" placeholder="asset id"></label><datalist id="forgeAssets"></datalist>
         <label>Variant<input name="variant" required class="text-control" list="forgeVariants" placeholder="variant id"></label><datalist id="forgeVariants"></datalist></div>
         <label class="forge-check"><input id="iterateToggle" type="checkbox"> Iterate an existing version</label>
+        <label class="forge-check"><input id="generateToggle" type="checkbox"> Generate blockout from photos</label>
+        <div id="generateFields" hidden><div class="forge-fields">
+          <label>Height hint (m)<input id="generateHeightHint" type="number" min="1" max="300" step="any" value="12" class="text-control"></label>
+          <label>Floor height (m)<input id="generateFloorHeight" type="number" min="1" max="10" step="any" value="3" class="text-control"></label></div>
+          <p>Choose one to seven photos and capture cutouts in total.</p>
+          <button id="generateLatestCutouts" type="button" class="button secondary">Use latest capture cutouts</button>
+          <div id="generateCutouts" class="forge-fields"></div></div>
         <div id="iterateFields" hidden><div class="forge-fields"><label>Parent version<select id="parentVersion" class="select-control"><option value="">Choose a library version</option></select></label>
         <label>Intent<select id="iterateIntent" class="select-control"><option value="iterate_views">iterate_views</option><option value="iterate_params">iterate_params</option></select></label></div><div id="replacementSlots" class="forge-slots"></div></div>
         <div id="freshUploads"></div>
@@ -78,7 +86,18 @@ class BoardView {
         <button class="button primary" type="submit">Create job →</button><p id="forgeFormError" class="forge-error" role="alert"></p>
       </form><div id="forgeJobs" class="forge-jobs" aria-live="polite"></div>`;
     this.uploads = dropzone($("#freshUploads"), (files) => { this.files = files; });
-    $("#iterateToggle").addEventListener("change", () => this.mode());
+    $("#iterateToggle").addEventListener("change", () => {
+      if ($("#iterateToggle").checked) $("#generateToggle").checked = false;
+      this.mode();
+    });
+    $("#generateToggle").addEventListener("change", () => {
+      if ($("#generateToggle").checked) {
+        $("#iterateToggle").checked = false;
+        if (!$('[name=variant]', root).value) $('[name=variant]', root).value = "default";
+      }
+      this.mode();
+    });
+    $("#generateLatestCutouts").onclick = guard(() => this.latestCutouts());
     $("#iterateIntent").addEventListener("change", () => this.mode());
     $("#parentVersion").addEventListener("change", guard(() => this.selectParent()));
     $("[name=asset]", root).addEventListener("input", () => this.variants());
@@ -123,9 +142,31 @@ class BoardView {
   mode() {
     const iterate = $("#iterateToggle").checked;
     $("#iterateFields").hidden = !iterate;
+    $("#generateFields").hidden = !$("#generateToggle").checked;
     $("#freshUploads").hidden = iterate;
     $("#replacementSlots").hidden = $("#iterateIntent").value !== "iterate_views";
     for (const name of ["asset", "variant"]) $(`[name=${name}]`, this.root).readOnly = iterate;
+  }
+
+  async latestCutouts() {
+    const control = $("#generateLatestCutouts"); control.disabled = true;
+    try {
+      const { runs } = await api("/v1/ui/runs?limit=5");
+      const container = $("#generateCutouts"); container.replaceChildren();
+      this.segmentRefs.clear();
+      const seen = new Set();
+      for (const run of runs.filter((run) => run.status === "completed" && run.image_id && run.segment_id)) {
+        const ref = { image_id: run.image_id, segment_id: run.segment_id };
+        const key = JSON.stringify(ref); if (seen.has(key)) continue; seen.add(key);
+        const label = document.createElement("label"); label.className = "forge-check";
+        label.innerHTML = `<input type="checkbox"><img width="96" height="96" style="object-fit:contain" src="/v1/ui/uploads/${encode(ref.image_id)}/segments/${encode(ref.segment_id)}/cutout" alt="Capture cutout"> ${esc(run.record_key)}`;
+        $("input", label).onchange = (event) => {
+          if (event.target.checked) this.segmentRefs.set(key, ref); else this.segmentRefs.delete(key);
+        };
+        container.append(label);
+      }
+      if (!container.childElementCount) container.textContent = "No completed capture cutouts in the latest five runs.";
+    } finally { control.disabled = false; }
   }
 
   async selectParent() {
@@ -157,6 +198,7 @@ class BoardView {
     showTab("forge");
     await this.refreshPickers();
     $("#iterateToggle").checked = true;
+    $("#generateToggle").checked = false;
     $("#parentVersion").value = version.job_id;
     await this.selectParent();
     this.root.scrollIntoView({ behavior: "smooth" });
@@ -167,14 +209,21 @@ class BoardView {
     submit.disabled = true; $("#forgeFormError").textContent = "";
     try {
       const iterate = $("#iterateToggle").checked;
-      const intent = iterate ? $("#iterateIntent").value : "fresh";
+      const intent = iterate ? $("#iterateIntent").value : $("#generateToggle").checked ? "generate" : "fresh";
       if (iterate && !this.parent) throw new Error("Choose a parent version first.");
       const pairs = intent === "iterate_views" ? [...this.replacements] : [];
       const files = iterate ? pairs.map(([, file]) => file) : this.files;
-      if ((!files.length && intent !== "iterate_params") || files.length > 8) throw new Error("Choose between one and eight images.");
+      const refs = intent === "generate" ? [...this.segmentRefs.values()] : [];
+      if ((!files.length && !refs.length && intent !== "iterate_params") || files.length > 8) throw new Error("Choose between one and eight images.");
+      if (intent === "generate" && files.length + refs.length > 7) throw new Error("Choose at most seven photos/cutouts in total.");
       const body = new FormData();
       for (const name of ["asset", "variant"]) body.append(name, $(`[name=${name}]`, this.root).value.trim());
       body.append("intent", intent);
+      if (intent === "generate") {
+        body.append("segment_refs", JSON.stringify(refs));
+        body.append("height_hint", $("#generateHeightHint").value);
+        body.append("floor_height", $("#generateFloorHeight").value);
+      }
       const params = {};
       for (const input of this.root.querySelectorAll(".forge-advanced input")) params[input.name] = input.type === "checkbox" ? input.checked : input.value === "" ? null : Number(input.value);
       body.append("params", JSON.stringify(params));
@@ -193,10 +242,18 @@ class BoardView {
     let card = this.jobs.get(job.id);
     if (!card) {
       const root = document.createElement("article"); root.className = "forge-surface forge-job";
-      root.innerHTML = `<div class="forge-heading"><h2>${esc(job.asset)} / ${esc(job.variant)}</h2><span class="forge-state"></span></div><small>${esc(job.id)} · ${esc(job.intent)}</small><pre class="forge-log" aria-label="Worker marker log"></pre><p class="forge-error" role="alert"></p><div class="forge-job-actions"></div><div class="forge-review" hidden></div>`;
+      root.innerHTML = `<div class="forge-heading"><h2>${esc(job.asset)} / ${esc(job.variant)}</h2><span class="forge-state"></span></div><small>${esc(job.id)} · ${esc(job.intent)}</small><pre class="forge-log" aria-label="Worker marker log"></pre><p class="forge-error" role="alert"></p><div class="forge-job-actions"></div><div class="forge-blockout-review" hidden></div><div class="forge-review" hidden></div>`;
       $("#forgeJobs").prepend(root); card = { root, log: [], job }; this.jobs.set(job.id, card);
     }
     card.job = job;
+    const blockoutRoot = $(".forge-blockout-review", card.root);
+    blockoutRoot.hidden = job.intent !== "generate" || job.state !== "review" || !job.generate?.blockout;
+    const revision = `${job.generate?.regenerations}:${job.state}:${!!job.match.submitted}`;
+    if (card.revision !== revision) {
+      card.review = null;
+      if (!blockoutRoot.hidden) card.blockout = new BlockoutReview(blockoutRoot, job, (updated) => this.card(updated), () => card.review);
+      card.revision = revision;
+    }
     const chip = $(".forge-state", card.root); chip.textContent = job.state; chip.dataset.state = job.state;
     const lines = job.worker_log || [];
     // The API retains a rolling tail. Match its largest overlap to append only new lines.
@@ -221,7 +278,74 @@ class BoardView {
       if (action === "approve") this.card(await api(`${forge}/jobs/${job.id}/approve`, { method: "POST" }));
       if (action === "version") { showTab("library"); await detail.open({ ...job, number: job.version_number }); }
     });
-    if (job.state !== "review" || job.match.submitted) $(".forge-review", card.root).hidden = true;
+    if (job.state !== "review" || job.match.submitted) {
+      $(".forge-review", card.root).hidden = true;
+      card.review = null;
+    }
+  }
+}
+
+class BlockoutReview {
+  constructor(root, job, updated, matchReview) {
+    this.root = root; this.job = job;
+    const blockout = job.generate.blockout;
+    const id = `blockoutReview-${job.id}`;
+    root.id = id;
+    root.innerHTML = `<h3>Blockout review</h3>
+      <div id="${id}-renders" class="blockout-renders"><img style="max-width:100%;max-height:360px" alt="Blockout render"><p class="blockout-view-name"></p><div class="button-row">${button("Previous render", "previous")}${button("Next render", "next")}</div></div>
+      <table class="blockout-params"><tbody>${Object.entries(blockout.params).map(([name, value]) => `<tr><th>${esc(name)}</th><td>${esc(typeof value === "object" ? JSON.stringify(value) : String(value))}</td></tr>`).join("")}</tbody></table>
+      <div class="blockout-palette"></div><h4>Confidence</h4><pre>${pretty(blockout.confidence)}</pre>
+      <ul class="blockout-assumptions">${blockout.assumptions.map((text) => `<li>${esc(text)}</li>`).join("")}</ul>
+      <p class="blockout-next-view">Suggested next view: ${esc(blockout.next_view)}</p>
+      <fieldset id="${id}-regenerate" ${job.match.submitted ? "disabled" : ""}><legend>Regenerate blockout (${job.generate.regenerations}/8)</legend>
+        <div class="forge-fields"><label>Height hint (m)<input class="text-control blockout-height" type="number" min="1" max="300" step="any" value="${esc(job.generate.height_hint)}"></label>
+        <label>Floor height (m)<input class="text-control blockout-floor" type="number" min="1" max="10" step="any" value="${esc(job.generate.floor_height)}"></label>
+        <label>Tower override<select class="select-control blockout-tower"><option value="keep">Keep inferred tower</option><option value="none">No tower</option></select></label></div>
+        <div class="blockout-palette-inputs forge-fields"></div>${button("Regenerate", "regenerate", "primary")}</fieldset>`;
+    for (const [role, color] of Object.entries(blockout.palette)) {
+      const hex = `#${color.hex.replace(/^#/, "")}`;
+      const swatch = document.createElement("span"); swatch.textContent = `${role} ${hex} `;
+      if (/^#[0-9a-f]{6}$/i.test(hex)) swatch.style.borderLeft = `24px solid ${hex}`;
+      $(".blockout-palette", root).append(swatch);
+      const label = document.createElement("label"); label.textContent = `${role} hex`;
+      const input = document.createElement("input"); input.type = "text"; input.className = "text-control";
+      input.pattern = "#?[0-9a-fA-F]{6}"; input.value = hex; input.dataset.role = role;
+      label.append(input); $(".blockout-palette-inputs", root).append(label);
+    }
+    $(".blockout-tower", root).value = job.generate.tower_override === "none" ? "none" : "keep";
+    let index = 0;
+    const render = () => {
+      const view = blockout.views[index];
+      $(".blockout-renders img", root).src = `${forge}/jobs/${job.id}/renders/${encode(view)}.png?generation=${job.generate.regenerations}`;
+      $(".blockout-view-name", root).textContent = `${view} (${index + 1}/${blockout.views.length})`;
+    };
+    render();
+    $("[data-action=previous]", root).onclick = () => { index = (index + blockout.views.length - 1) % blockout.views.length; render(); };
+    $("[data-action=next]", root).onclick = () => { index = (index + 1) % blockout.views.length; render(); };
+    const regenerate = $("[data-action=regenerate]", root);
+    regenerate.disabled = !!job.match.submitted || job.generate.regenerations >= 8;
+    regenerate.onclick = guard(async () => {
+      for (const input of root.querySelectorAll("input")) if (!input.reportValidity()) return;
+      const review = matchReview();
+      if (review?.submitting || job.match.submitted) return;
+      const fieldset = $("fieldset", root); fieldset.disabled = true;
+      if (review) { review.submitting = true; $(".forge-submit", review.root).disabled = true; }
+      try {
+        if (review) await review.saves;
+        const palette_hex = {};
+        for (const input of root.querySelectorAll("[data-role]")) {
+          if (input.value.replace(/^#/, "").toLowerCase() !== blockout.palette[input.dataset.role].hex.replace(/^#/, "").toLowerCase()) palette_hex[input.dataset.role] = input.value;
+        }
+        updated(await api(`${forge}/jobs/${job.id}/blockout/regenerate`, json({
+          height_hint: Number($(".blockout-height", root).value), floor_height: Number($(".blockout-floor", root).value),
+          tower_override: $(".blockout-tower", root).value, palette_hex,
+        })));
+        toast("Regenerating blockout. Waiting for new renders and matches.");
+      } finally {
+        fieldset.disabled = !!job.match.submitted;
+        if (review) { review.submitting = false; $(".forge-submit", review.root).disabled = false; }
+      }
+    });
   }
 }
 
@@ -254,16 +378,20 @@ class MatchReview {
   }
 
   async loadSheets() {
-    for (const upload of this.job.uploads) {
+    const sources = [
+      ...this.job.uploads.map((upload) => ({ ...upload, route: `uploads/${upload.index}`, key: "upload_index" })),
+      ...(this.job.generate?.segment_refs || []).map((ref, index) => ({ index, filename: `Capture cutout ${index + 1}`, route: `cutouts/${index}.png`, key: "cutout_index" })),
+    ];
+    for (const upload of sources) {
       const frame = document.createElement("section");
       frame.innerHTML = `<h4>${esc(upload.filename)}</h4><canvas aria-label="Panel overlay for ${esc(upload.filename)}"></canvas><div class="forge-panel-list"></div>`;
       $(".forge-sheets", this.root).append(frame);
       const canvas = $("canvas", frame); const image = new Image();
-      const panels = this.job.match.panels.filter((p) => p.upload_index === upload.index);
+      const panels = this.job.match.panels.filter((p) => p[upload.key] === upload.index);
       const sheet = { canvas, image, panels }; this.sheets.push(sheet);
       image.onload = () => { canvas.width = image.naturalWidth; canvas.height = image.naturalHeight; this.drawSheets(); };
       image.onerror = () => { toast(`Could not load ${upload.filename}`, true); };
-      image.src = `${forge}/jobs/${this.job.id}/uploads/${upload.index}`;
+      image.src = `${forge}/jobs/${this.job.id}/${upload.route}`;
       canvas.onclick = (event) => {
         const bounds = canvas.getBoundingClientRect();
         const x = (event.clientX - bounds.left) * canvas.width / bounds.width;

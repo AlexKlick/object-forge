@@ -407,6 +407,16 @@ class ForgeBakeTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"protected")
         self.assertEqual(self.store.get_job(job["id"])["state"], "failed")
 
+    def test_non_generate_bake_argv_is_byte_identical(self):
+        job = self.staged(turntable=0)
+        with patch.dict(os.environ, {"FORGE_BAKE_CMD": "", "FORGE_BAKE_PYTHON": "/custom/python"}):
+            self.assertEqual(self.worker.bake_command(job), [
+                "/custom/python", str(self.assets / "tools/bake.py"), "--asset", "a", "--variant", "v",
+                "--atlas-tile", "1024", "--ownership-min", "0.5", "--view-iou-warn", "0.9"])
+        legacy = 'python "script with spaces.py" --literal="{untouched}"'
+        with patch.dict(os.environ, {"FORGE_BAKE_CMD": legacy}):
+            self.assertEqual(self.worker.bake_command(job), shlex.split(legacy))
+
     def test_bake_command_defaults_params_and_override(self):
         job = self.staged(turntable=0)
         with patch.dict(os.environ, {"FORGE_BAKE_CMD": "", "FORGE_BAKE_PYTHON": "/custom/python"}):

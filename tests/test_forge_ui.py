@@ -41,6 +41,18 @@ class ShellParser(HTMLParser):
 
 
 class ForgeUiTests(unittest.TestCase):
+    def test_generate_board_blockout_review_and_cutout_sources(self):
+        source = (WEB / "forge.js").read_text()
+        for token in ("Generate blockout from photos", "generateToggle", "generateHeightHint", "generateFloorHeight",
+                      "generateLatestCutouts", "generateCutouts", "/v1/ui/runs?limit=5", 'run.status === "completed"',
+                      'body.append("segment_refs"', 'body.append("height_hint"', 'body.append("floor_height"',
+                      "class BlockoutReview", "blockoutReview-${job.id}", "blockout-renders", "blockout-params",
+                      "blockout-palette", "blockout-assumptions", "blockout-next-view", "/blockout/regenerate",
+                      "job.generate.regenerations >= 8", 'key: "cutout_index"', 'fieldset.disabled = !!job.match.submitted'):
+            self.assertIn(token, source)
+        self.assertLess(source.index('<div class="forge-blockout-review"'), source.index('<div class="forge-review"'))
+        self.assertIn('aria-label="Bake Forge: sheets, iterations, and blockouts from photos"', (WEB / "index.html").read_text())
+
     def test_shell_tabs_modules_and_balanced_html(self):
         shell = ShellParser()
         shell.feed((WEB / "index.html").read_text())

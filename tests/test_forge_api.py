@@ -87,6 +87,64 @@ class ForgeApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return job, response.json()
 
+    def test_generate_form_validation_and_cutout_proxy(self):
+        image = self.client.post("/v1/ui/uploads", files={"file": ("photo.png", png_bytes(), "image/png")}).json()
+        response = self.client.post(f"/v1/ui/uploads/{image['image_id']}/segments", json={"points": [{"x": 4, "y": 4, "label": 1}]})
+        self.assertEqual(response.status_code, 200, response.text)
+        segment = response.json()
+        ref = {"image_id": image["image_id"], "segment_id": segment["segment_id"]}
+        fields = {"asset": "a", "variant": "default", "intent": "generate", "segment_refs": json.dumps([ref]), "height_hint": "18", "floor_height": "4"}
+        result = self.client.post("/v1/forge/jobs", data=fields)
+        self.assertEqual(result.status_code, 201, result.text)
+        job = result.json(); base = f"/v1/forge/jobs/{job['id']}"
+        self.assertEqual(job["generate"]["height_hint"], 18)
+        self.assertEqual(job["generate"]["floor_height"], 4)
+        proxy = self.client.get(base + "/cutouts/0.png")
+        self.assertEqual(proxy.status_code, 200)
+        self.assertEqual(proxy.content, self.app.state.store.segment_file(ref["image_id"], ref["segment_id"], "cutout").read_bytes())
+        for index in (-1, 1):
+            self.assertEqual(self.client.get(base + f"/cutouts/{index}.png").status_code, 404)
+        badref = {**ref, "segment_id": "missing"}
+        missing = self.client.post("/v1/forge/jobs", data={**fields, "segment_refs": json.dumps([badref])}).json()
+        self.assertEqual(self.client.get(f"/v1/forge/jobs/{missing['id']}/cutouts/0.png").status_code, 404)
+        for changed in ({"segment_refs": "[]"}, {"segment_refs": "bad"}, {"height_hint": "nan"}, {"floor_height": "11"}, {"segment_refs": json.dumps([ref] * 8)}):
+            response = self.client.post("/v1/forge/jobs", data={**fields, **changed})
+            self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.client.post(base + "/blockout/regenerate", json={}).status_code, 409)
+
+    def test_generate_worker_routes_and_regenerate_conflicts(self):
+        from test_forge_generate_store import blockout_payload
+        job = self.upload(intent="generate", canonical_views='["front"]', height_hint="21", floor_height="3")
+        base = f"/v1/forge/jobs/{job['id']}"
+        claim = self.store.claim_job(stages=["matching"], job_id=job["id"])
+        lease = claim["lease"]["lease_id"]
+        payload = blockout_payload(); spec = payload.pop("spec_yaml")
+        body = {"blockout": payload, "lease_id": lease, "artifact": {"encoding": "base64", "data": base64.b64encode(spec).decode()}}
+        self.assertEqual(self.client.post(base + "/renders/front.png", content=png_bytes()).status_code, 409)
+        self.assertEqual(self.client.post(base + "/blockout", json={**body, "lease_id": "bad"}).status_code, 409)
+        with patch.dict(os.environ, {"FORGE_WORKER_TOKEN": "private-test"}):
+            self.assertEqual(self.client.post(base + "/blockout", json=body).status_code, 403)
+            self.assertEqual(self.client.post(base + "/renders/front.png", content=png_bytes(), headers={"X-Forge-Lease": lease}).status_code, 403)
+        self.assertEqual(self.client.post(base + "/renders/front.png", content=png_bytes(), headers={"X-Forge-Lease": lease}).status_code, 200)
+        response = self.client.post(base + "/blockout", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.client.get(base + "/blockout").json(), payload)
+        self.assertEqual(self.client.get(base + "/blockout/spec.yaml").content, spec)
+        self.assertEqual(self.client.get(base + "/renders/front.png").content, png_bytes())
+        self.store.worker_match(job["id"], {"panels": [], "views_missing": ["front"]}, lease)
+        self.assertEqual(self.client.post(base + "/blockout", json=body).status_code, 409)
+        response = self.client.post(base + "/blockout/regenerate", json={"height_hint": 30})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"], "matching")
+        self.assertEqual(self.client.get(base + "/blockout").status_code, 404)
+        self.assertEqual(self.client.post(base + "/blockout", json=body).status_code, 409)
+        claim = self.store.claim_job(stages=["matching"], job_id=job["id"])
+        self.store.worker_match(job["id"], {"panels": [], "views_missing": ["front"]}, claim["lease"]["lease_id"])
+        self.store.review(job["id"], "submit", [], ["front"])
+        self.assertEqual(self.client.post(base + "/blockout/regenerate", json={}).status_code, 409)
+        fresh = self.reviewing()
+        self.assertEqual(self.client.post(f"/v1/forge/jobs/{fresh['id']}/blockout/regenerate", json={}).status_code, 409)
+
     def test_disabled_router_absent_and_existing_responses_identical(self):
         snapshots = []
         for value in (None, "0", "false", "off"):
