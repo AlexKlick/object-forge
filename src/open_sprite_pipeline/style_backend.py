@@ -65,7 +65,13 @@ class DiffusersBackend:
             self.pipe.load_ip_adapter(self.ip_adapter, subfolder="models",
                                       weight_name="ip-adapter_sd15.safetensors")
             self.pipe.enable_model_cpu_offload(device=self.device)
-            self.pipe.enable_attention_slicing()
+            # No enable_attention_slicing(): it re-sets every attention
+            # processor to a sliced/plain one, which discards the IP-Adapter
+            # processors installed by load_ip_adapter — the UNet then hands the
+            # (text, image) embedding tuple to a processor that expects a
+            # tensor ("'tuple' object has no attribute 'shape'", seen on the
+            # first real render). torch's fused SDPA is memory-frugal enough
+            # at long_side <= 1024.
             # Bound VAE activation memory at the upper working resolution.
             # diffusers 0.40 removed the pipeline-level enable_vae_slicing /
             # enable_vae_tiling wrappers; the VAE exposes them directly.

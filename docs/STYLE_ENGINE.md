@@ -21,11 +21,18 @@ remain operator smoke checks, not a conclusion from unit tests.
 The container receives only physical GPU 1, addressed inside it as `cuda:0`.
 Models load lazily under one process-local lock, after at least 4500 MiB free is
 reported. Missing CUDA/free-memory data also fails closed. The guard is checked
-again for subsequent requests, even while loaded. Inference uses model CPU
-offload, attention slicing, and VAE slicing/tiling. Each render resets peak CUDA
-allocation tracking. Idle models unload after 180 seconds, checked every 15
-seconds. Unload drops the pipeline, collects Python objects, and empties the CUDA
-cache. A failed inference unloads the backend before releasing the lock.
+again for subsequent requests, even while loaded; for that recheck the backend
+counts torch's reserved-but-unallocated allocator cache as available, because
+the device reports it as used although only this process can reuse it.
+Inference uses model CPU offload and VAE slicing/tiling — **not** attention
+slicing, which would replace the IP-Adapter attention processors with plain
+ones and break the first render (`'tuple' object has no attribute 'shape'`).
+Each render resets peak CUDA allocation tracking. Idle models unload after 180
+seconds, checked every 15 seconds. Unload drops the pipeline, collects Python
+objects, and empties the CUDA cache. A failed load or inference unloads the
+backend, answers **500 `{"error": "backend_error", "detail": "<Type>: <message>"}`**,
+and unloads once more after the exception is discarded so the allocator cache
+really returns to the device (re-raising left ~3.8 GB reserved, measured).
 
 Run a single Uvicorn worker: the lock coordinates only this process. GPU memory
 admission is a snapshot, not a reservation against another process growing during

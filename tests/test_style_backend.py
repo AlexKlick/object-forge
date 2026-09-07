@@ -53,7 +53,8 @@ class DiffusersBackendContractTests(unittest.TestCase):
         self.pipe.load_ip_adapter.assert_called_once_with(
             "adapter", subfolder="models", weight_name="ip-adapter_sd15.safetensors")
         self.pipe.enable_model_cpu_offload.assert_called_once_with(device="cuda:0")
-        self.pipe.enable_attention_slicing.assert_called_once_with()
+        # Attention slicing would overwrite the IP-Adapter attention processors.
+        self.pipe.enable_attention_slicing.assert_not_called()
         self.pipe.vae.enable_slicing.assert_called_once_with()
         self.pipe.vae.enable_tiling.assert_called_once_with()
         self.pipe.set_progress_bar_config.assert_called_once_with(disable=True)

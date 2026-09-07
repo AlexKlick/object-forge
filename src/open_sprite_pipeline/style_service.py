@@ -241,6 +241,7 @@ def create_style_app(backend: StyleBackend | None = None, *, clock=time.monotoni
             started = time.perf_counter()
             candidates = []
             peak = None
+            failure = None
             try:
                 if not state.backend.loaded:
                     state.backend.load()
@@ -260,13 +261,24 @@ def create_style_app(backend: StyleBackend | None = None, *, clock=time.monotoni
                     measured = getattr(state.backend, "peak_mb", lambda: None)()
                     if measured is not None:
                         peak = measured if peak is None else max(peak, measured)
-            except Exception:
+            except Exception as exc:
                 # Release failed inference's resident model before accepting work.
+                LOG.exception("style render failed view=%r", request.view)
+                failure = f"{type(exc).__name__}: {str(exc)[:400]}"
                 if state.backend.loaded:
                     state.backend.unload()
-                raise
             finally:
                 state.last_used = clock()
+            if failure is not None:
+                # Outside the except block the exception and its traceback —
+                # which referenced every tensor on the failing call stack — are
+                # gone, so this second unload's empty_cache() actually returns
+                # the memory to the device. Re-raising instead left ~3.8 GB
+                # reserved after a failed first render (measured), which the
+                # admission guard then counted against the next request.
+                state.backend.unload()
+                return JSONResponse(status_code=500,
+                                    content={"error": "backend_error", "detail": failure})
             LOG.info("style render view=%r seeds=%s working_size=%s seconds=%.3f peak_mb=%s",
                      request.view, request.seeds, init_rgb.size, time.perf_counter() - started, peak)
             return {"candidates": candidates, "box": list(box), "scale": scale,

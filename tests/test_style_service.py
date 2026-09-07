@@ -323,9 +323,17 @@ class StyleServiceTests(unittest.TestCase):
         self.assertEqual(state.renders, 2)
 
     def test_render_failure_unloads_and_releases_lock(self):
-        with patch.object(self.backend, "render", side_effect=RuntimeError("inference failed")):
-            with self.assertRaisesRegex(RuntimeError, "inference failed"):
-                self.post()
+        unloads = []
+        original_unload = self.backend.unload
+        with patch.object(self.backend, "render", side_effect=RuntimeError("inference failed")), \
+                patch.object(self.backend, "unload", side_effect=lambda: (unloads.append(1), original_unload())):
+            response = self.post()
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"error": "backend_error",
+                                           "detail": "RuntimeError: inference failed"})
+        # Once inside the except block, once more after the traceback is gone
+        # so the allocator cache is really released.
+        self.assertEqual(len(unloads), 2)
         self.assertFalse(self.backend.loaded)
         self.assertFalse(self.app.state.style.lock.locked())
         self.success()
