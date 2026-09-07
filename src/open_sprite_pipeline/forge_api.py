@@ -141,7 +141,7 @@ def assets(request: Request):
 async def create_job(request: Request):
     async with request.form(max_files=8, max_fields=16) as form:
         files = form.getlist("files") + form.getlist("files[]")
-        minimum = 0 if form.get("intent") in {"iterate_params", "generate"} else 1
+        minimum = 0 if form.get("intent") in {"iterate_params", "generate", "iterate_blockout"} else 1
         if not minimum <= len(files) <= 8 or not all(isinstance(f, UploadFile) for f in files):
             raise HTTPException(422, "Upload between one and eight images.")
         params = json.loads(form.get("params", "{}"))
@@ -170,6 +170,12 @@ async def create_job(request: Request):
                 raise ForgeStoreError("Unsupported image format.")
             prepared.append((upload.filename or "image", media_type, data))
         generate = None
+        if "edit" in form and form.get("intent") != "iterate_blockout":
+            raise ForgeStoreError("Edit requires iterate_blockout intent.")
+        if form.get("intent") == "iterate_blockout":
+            if files or any(key in form for key in ("segment_refs", "height_hint", "floor_height")):
+                raise ForgeStoreError("Blockout iteration accepts edit and inherited sources only.")
+            generate = {"edit": json.loads(form.get("edit", "{}"))}
         if form.get("intent") == "generate":
             generate = store(request).validate_generate({
                 "segment_refs": json.loads(form.get("segment_refs", "[]")),

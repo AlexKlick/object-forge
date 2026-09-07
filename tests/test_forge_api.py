@@ -87,6 +87,37 @@ class ForgeApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return job, response.json()
 
+    def test_iterate_blockout_form_edit_and_parent_validation(self):
+        parent = self.upload(intent="generate")
+        parent["state"] = "baking"; self.store._save_job(parent)
+        version = self.store.create_version(parent["id"], artifacts={"blockout/spec.yaml": b"asset: chair\n"})
+        fields = {"asset": "chair", "variant": "oak", "intent": "iterate_blockout",
+                  "parent_job": parent["id"], "parent_version": str(version["number"]), "edit": '{"height":18}'}
+        response = self.client.post("/v1/forge/jobs", data=fields)
+        self.assertEqual(response.status_code, 201, response.text)
+        child = response.json()
+        self.assertEqual(child["generate"]["edit"], {"height": 18})
+        self.assertEqual(child["inputs"]["parent_uploads"], [0])
+        self.assertEqual(self.client.get(f"/v1/forge/jobs/{child['id']}/uploads/0").content, png_bytes())
+        for changes in ({"edit": "{}"}, {"edit": '{"palette":{"body":"#ffffff"}}'}, {"edit": '{"height":301}'},
+                        {"edit": "{"}, {"parent_job": "missing"}, {"parent_version": "999"},
+                        {"intent": "iterate_params"}, {"height_hint": "20"}, {"params": '{"edit":{"height":18}}'}):
+            response = self.client.post("/v1/forge/jobs", data={**fields, **changes})
+            self.assertTrue(400 <= response.status_code < 500, response.text)
+        for omitted in ("parent_job", "parent_version", "edit"):
+            response = self.client.post("/v1/forge/jobs", data={k: v for k, v in fields.items() if k != omitted})
+            self.assertIn(response.status_code, (400, 422), response.text)
+        other = self.upload(intent="generate")
+        other["state"] = "baking"; self.store._save_job(other)
+        missing = self.store.create_version(other["id"], artifacts={})
+        response = self.client.post("/v1/forge/jobs", data={**fields, "parent_job": other["id"], "parent_version": str(missing["number"])})
+        self.assertIn(response.status_code, (400, 422), response.text)
+        fresh = self.upload()
+        fresh["state"] = "baking"; self.store._save_job(fresh)
+        non_generate = self.store.create_version(fresh["id"], artifacts={"blockout/spec.yaml": b"asset: chair\n"})
+        response = self.client.post("/v1/forge/jobs", data={**fields, "parent_job": fresh["id"], "parent_version": str(non_generate["number"])})
+        self.assertIn(response.status_code, (400, 422), response.text)
+
     def test_generate_form_validation_and_cutout_proxy(self):
         image = self.client.post("/v1/ui/uploads", files={"file": ("photo.png", png_bytes(), "image/png")}).json()
         response = self.client.post(f"/v1/ui/uploads/{image['image_id']}/segments", json={"points": [{"x": 4, "y": 4, "label": 1}]})

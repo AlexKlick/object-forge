@@ -357,6 +357,9 @@ class ForgeWorker:
         settings = job["generate"]
         values = {"inputs": inputs, "asset": job["asset"], "out": out,
                   "height_hint": settings["height_hint"], "floor_height": settings["floor_height"], "report": report}
+        # Both the legacy {inputs} expansion and explicit edit placeholders work.
+        values.update(edit_in=inputs[inputs.index("--edit-in") + 1] if "--edit-in" in inputs else "",
+                      edit=inputs[inputs.index("--edit") + 1] if "--edit" in inputs else "")
         override = os.getenv("FORGE_SYNTH_CMD")
         if override:
             return self.command_override(override, values)
@@ -366,39 +369,55 @@ class ForgeWorker:
                 "--floor-height", str(settings["floor_height"]), "--report", str(report)]
 
     def sources(self, job: dict):
+        base = f"/jobs/{job['id']}"
+        for index in job.get("inputs", {}).get("parent_uploads", []):
+            yield f"p{index}", f"/jobs/{job['parent_job']}/uploads/{index}", {"parent_upload_index": index}
         for upload in job["uploads"]:
-            yield f"u{upload['index']}", f"uploads/{upload['index']}", {"upload_index": upload["index"]}
+            yield f"u{upload['index']}", f"{base}/uploads/{upload['index']}", {"upload_index": upload["index"]}
         for index, _ in enumerate(job.get("generate", {}).get("segment_refs", [])):
-            yield f"c{index}", f"cutouts/{index}.png", {"cutout_index": index}
+            yield f"c{index}", f"{base}/cutouts/{index}.png", {"cutout_index": index}
 
     def process_generate(self, job: dict) -> dict:
         ws = self.workspace_root(job)
         base = f"/jobs/{job['id']}"
-        inputs = []
-        for name, route, metadata in self.sources(job):
-            data = self.client.request("GET", base + "/" + route)
-            image = self.matcher.load_image(BytesIO(data))
-            if "upload_index" in metadata:
-                image.putalpha(self.matcher.match_mask(image, self.matcher.background_color(image)))
-                data = png(image)
-            target = checked_path(ws, f"in/{name}.png")
-            target.write_bytes(data)  # Always copy; never link into input stores.
-            inputs.extend(["--image", str(target)])
-        count = len(inputs) // 2
-        if not 1 <= count <= 7:
-            raise ValueError("spec_synth requires one to seven inputs; none may be silently dropped.")
-        if count == 1:
-            inputs.append("--force-single")
         settings = job["generate"]
-        if settings.get("tower_override") == "none":
-            inputs.extend(["--override", "tower=none"])
         spec_path = checked_path(ws, f"specs/{job['asset']}.yaml")
         report_path = checked_path(ws, "synth_report.json")
-        # No stale success on an override that exits without producing output.
-        spec_path.unlink(missing_ok=True)
-        report_path.unlink(missing_ok=True)
-        self.run_workspace_command(job, self.synth_command(job, inputs, spec_path, report_path), "synth")
-        report = json.loads(report_path.read_bytes())
+        if job["intent"] == "iterate_blockout":
+            parent_spec = checked_path(ws, f"specs/{job['asset']}.parent.yaml")
+            parent_spec.write_bytes(self.client.request("GET",
+                f"/assets/{job['asset']}/variants/{job['variant']}/versions/{job['parent_version']}/artifacts/blockout/spec.yaml"))
+            spec_path.unlink(missing_ok=True)
+            report_path.unlink(missing_ok=True)
+            inputs = ["--edit-in", str(parent_spec), "--edit", json.dumps(settings["edit"], allow_nan=False)]
+            self.run_workspace_command(job, self.synth_command(job, inputs, spec_path, report_path), "synth-edit")
+            report = json.loads(report_path.read_bytes())
+            report["edit"] = settings["edit"]
+            # Pure surgery has no inferred next-view recommendation.
+            report["next_view"] = report.get("next_view") or ""
+        else:
+            inputs = []
+            for name, route, metadata in self.sources(job):
+                data = self.client.request("GET", route)
+                image = self.matcher.load_image(BytesIO(data))
+                if "upload_index" in metadata:
+                    image.putalpha(self.matcher.match_mask(image, self.matcher.background_color(image)))
+                    data = png(image)
+                target = checked_path(ws, f"in/{name}.png")
+                target.write_bytes(data)  # Always copy; never link into input stores.
+                inputs.extend(["--image", str(target)])
+            count = len(inputs) // 2
+            if not 1 <= count <= 7:
+                raise ValueError("spec_synth requires one to seven inputs; none may be silently dropped.")
+            if count == 1:
+                inputs.append("--force-single")
+            if settings.get("tower_override") == "none":
+                inputs.extend(["--override", "tower=none"])
+            # No stale success on an override that exits without producing output.
+            spec_path.unlink(missing_ok=True)
+            report_path.unlink(missing_ok=True)
+            self.run_workspace_command(job, self.synth_command(job, inputs, spec_path, report_path), "synth")
+            report = json.loads(report_path.read_bytes())
         edit = {}
         if isinstance(settings.get("tower_override"), dict):
             edit["tower"] = settings["tower_override"]
@@ -717,7 +736,7 @@ class ForgeWorker:
         self.client.request("PATCH", base, {"canonical_views": list(masks), "lease_id": lease})
         panels = []
         for name, route, metadata in self.sources(job):
-            image = tool.load_image(BytesIO(self.client.request("GET", base + "/" + route)))
+            image = tool.load_image(BytesIO(self.client.request("GET", route)))
             bg = tool.background_color(image)
             detection = tool.object_mask(image, bg)
             mask = tool.match_mask(image, bg)
@@ -823,7 +842,7 @@ class ForgeWorker:
             raise ValueError("Review has not been submitted.")
         with self.heartbeats(job):
             self.progress(job, f"START {job['state']} job={job['id']}")
-            empty_iteration = job["parent_job"] and not job["uploads"]
+            empty_iteration = job["parent_job"] and not job["uploads"] and not self.generate_family(job)
             if self.generate_family(job):
                 if job["state"] == "matching":
                     masks = self.process_generate(job)

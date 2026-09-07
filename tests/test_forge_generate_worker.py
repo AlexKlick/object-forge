@@ -131,6 +131,172 @@ class GenerateWorkerTests(unittest.TestCase):
         self.assertEqual(result['state'], 'staged')
         return result
 
+    def gl5_fakes(self):
+        # Preserve every GL4 fixture/test; the edit fake uses the copied pure
+        # surgery helper, while counting every subprocess invocation.
+        fake = SYNTH.replace("    spec = yaml.safe_load(a.edit_in.read_text()); edits = json.loads(a.edit)\n    for role, color in edits.get('palette', {}).items(): spec['palette'][role]['hex'] = color\n    if edits.get('tower'): spec['massing']['tower'].update(edits['tower'])",
+                             "    from spec_synth import apply_overrides\n    spec = apply_overrides(yaml.safe_load(a.edit_in.read_text()), json.loads(a.edit))")
+        fake = fake.replace("'plinth': {'floors': 4,", "'plinth': {'material': 'body', 'floors': 4,")
+        calls = self.root / 'synth-invocations.jsonl'
+        fake = (f"import sys\nsys.path.insert(0, {str(self.assets / 'tools')!r})\n" + fake)
+        fake += f"\nwith open({str(calls)!r}, 'a') as log: log.write(json.dumps({{'edit': json.loads(a.edit) if a.edit else None, 'images': a.image}}) + '\\n')\n"
+        (self.root / 'fake synth.py').write_text(fake)
+        render = BLOCKOUT.replace('(64, 20)', "(64, max(2, 32 - spec['massing']['plinth']['floors'] * 3))")
+        (self.root / 'fake blockout.py').write_text(render)
+        return calls
+
+    def finish_generated(self, job):
+        self.stage(job)
+        self.client.request('POST', f"/jobs/{job['id']}/approve")
+        ready = self.worker.run_next()
+        self.assertEqual(ready['state'], 'ready')
+        return self.store.get_version('a', 'v', ready['version_number'])
+
+    def edit_child(self, parent, edit, **fields):
+        response = self.http.post('/v1/forge/jobs', data={'asset': 'a', 'variant': 'v',
+            'intent': 'iterate_blockout', 'parent_job': parent['job_id'], 'parent_version': str(parent['number']),
+            'params': json.dumps({'turntable': 1}), 'edit': json.dumps(edit), **fields})
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
+
+    def test_edit_only_child_lifecycle_fresh_matching_immutable_parent_and_root_lineage(self):
+        calls = self.gl5_fakes()
+        parent_job = self.reviewing()
+        parent = self.finish_generated(parent_job)
+        artifact = self.store.artifact_file('a', 'v', 1, 'blockout/spec.yaml')
+        before = artifact.read_bytes(); before_stat = artifact.stat().st_mtime_ns
+        original = yaml.safe_load(before)
+        child = self.edit_child(parent, {'height': 18})
+        self.assertEqual(child['inputs']['parent_uploads'], [0])
+        self.assertEqual(child['uploads'], [])
+        self.assertEqual(child['inputs']['parent_views_inherited'], [])
+        # An intentionally different creation-time list must be replaced by
+        # the inherited spec's actual canonical views.
+        child['canonical_views'] = ['obsolete']; self.store._save_job(child)
+        child = self.worker.run_next()
+        self.assertEqual(child['state'], 'review')
+        self.assertEqual(child['canonical_views'], VIEWS)
+        panel = child['match']['panels'][0]
+        self.assertEqual(panel['panel_id'], 'p0-p0')
+        self.assertEqual(panel['parent_upload_index'], 0)
+        self.assertEqual(panel['auto_view'], 'front_left')
+        self.assertEqual(panel['decision'], 'accept')
+        self.assertGreaterEqual(panel['iou'], child['params']['iou'])
+        self.assertEqual(child['match']['decisions'], [])
+        edited_bytes = self.store.blockout_file(child['id'], 'spec.yaml').read_bytes()
+        expected = yaml.safe_load(before); expected['massing']['plinth']['floors'] = 6
+        self.assertEqual(yaml.safe_load(edited_bytes), expected)
+        self.assertEqual(original['massing']['plinth']['floors'], 4)
+        self.assertEqual(child['generate']['blockout']['params']['height'], 18)
+        self.assertEqual(child['generate']['blockout']['synth_report']['edit'], {'height': 18})
+        self.assertNotEqual(self.store.blockout_file(child['id'], 'renders/front_left.png').read_bytes(),
+                            self.store.blockout_file(parent_job['id'], 'renders/front_left.png').read_bytes())
+        version = self.finish_generated(child)
+        self.assertEqual(version['number'], 2)
+        self.assertEqual(version['lineage'], {'parent_version': 1, 'root_version': 1})
+        self.assertEqual(self.store.artifact_file('a', 'v', 2, 'blockout/spec.yaml').read_bytes(), edited_bytes)
+        self.assertEqual((artifact.read_bytes(), artifact.stat().st_mtime_ns), (before, before_stat))
+        self.assertEqual([json.loads(line)['edit'] for line in calls.read_text().splitlines()], [None, {'height': 18}])
+        grandchild = self.edit_child(version, {'floor_height': 2, 'palette': {'body': 'ABCDEF'}})
+        self.assertEqual(grandchild['inputs']['parent_uploads'], [0])
+        grandchild = self.worker.run_next()
+        self.assertEqual(grandchild['match']['panels'][0]['panel_id'], 'p0-p0')
+        expected['massing']['plinth'].update(floors=9, floor_height=2)
+        expected['palette']['body']['hex'] = 'abcdef'
+        self.assertEqual(yaml.safe_load(self.store.blockout_file(grandchild['id'], 'spec.yaml').read_bytes()), expected)
+        third = self.finish_generated(grandchild)
+        self.assertEqual(third['lineage'], {'parent_version': 2, 'root_version': 1})
+        self.assertEqual(artifact.read_bytes(), before)
+        self.assertEqual(self.store.artifact_file('a', 'v', 2, 'blockout/spec.yaml').read_bytes(), edited_bytes)
+        self.assertEqual(len(calls.read_text().splitlines()), 3)
+
+    def test_edit_child_workspace_lock_claim_and_restore_before_bake(self):
+        self.gl5_fakes()
+        parent = self.finish_generated(self.reviewing())
+        child = self.edit_child(parent, {'height': 18})
+        with self.worker.bake_lock(child, 'workspace'):
+            self.assertIsNone(ForgeWorker(self.client, self.assets).run_next())
+            self.assertIsNone(self.store.get_job(child['id'])['lease'])
+        self.assertTrue((self.store.root / 'locks/a__v.workspace.lock').exists())
+        self.assertFalse((self.store.root / 'locks/a__v.lock').exists())
+        child = self.worker.run_next()
+        saved = self.store.blockout_file(child['id'], 'spec.yaml').read_bytes()
+        other = self.edit_child(parent, {'height': 24})
+        self.worker.run_next()
+        self.assertNotEqual((self.worker.workspace_root(child) / 'specs/a.yaml').read_bytes(), saved)
+        self.stage(child)
+        self.assertEqual((self.worker.workspace_root(child) / 'specs/a.yaml').read_bytes(), saved)
+        self.client.request('POST', f"/jobs/{child['id']}/approve")
+        with self.worker.bake_lock(child, 'workspace'):
+            self.assertIsNone(ForgeWorker(self.client, self.assets).run_next())
+            self.assertEqual(self.store.get_job(child['id'])['state'], 'queued_bake')
+        self.assertEqual(self.worker.run_next()['state'], 'ready')
+        self.assertEqual(self.store.artifact_file('a', 'v', 2, 'blockout/spec.yaml').read_bytes(), saved)
+        self.assertEqual(self.store.get_job(other['id'])['state'], 'review')
+
+    def test_edit_explicit_placeholders_and_no_stale_success(self):
+        calls = self.gl5_fakes()
+        parent = self.finish_generated(self.reviewing())
+        child = self.edit_child(parent, {'plinth_floors': 7})
+        override = f"{shlex.quote(sys.executable)} {shlex.quote(str(self.root / 'fake synth.py'))} --edit-in {{edit_in}} --edit {{edit}} --out {{out}} --report {{report}}"
+        with patch.dict(os.environ, {'FORGE_SYNTH_CMD': override}):
+            child = self.worker.run_next()
+        self.assertEqual(child['state'], 'review')
+        self.assertEqual(child['generate']['blockout']['params']['plinth']['floors'], 7)
+        records = [json.loads(line) for line in calls.read_text().splitlines()]
+        self.assertEqual(records[-1], {'edit': {'plinth_floors': 7}, 'images': []})
+        for code in ('pass', 'import sys; sys.exit(2)'):
+            child = self.edit_child(parent, {'height': 18})
+            with patch.dict(os.environ, {'FORGE_SYNTH_CMD': shlex.join([sys.executable, '-c', code])}):
+                with self.assertRaises((ValueError, FileNotFoundError)): self.worker.run_next()
+            current = self.store.get_job(child['id'])
+            self.assertNotEqual(current['state'], 'review')
+            self.assertIsNone(current['generate']['blockout'])
+
+    def test_real_companion_edit_child_tower_toggle_and_section_floor_recomputation(self):
+        # Real CLI operates on copied tools, with fake rendering/bake only.
+        with patch.dict(os.environ, {'FORGE_SYNTH_CMD': ''}):
+            job = self.reviewing()
+            self.client.request('POST', f"/jobs/{job['id']}/blockout/regenerate", {'tower_override': 'none'})
+            parent = self.finish_generated(self.worker.run_next())
+            original = self.store.artifact_file('a', 'v', 1, 'blockout/spec.yaml').read_bytes()
+            self.edit_child(parent, {'tower': {'enabled': True, 'width': 3, 'location': 'front_center'},
+                                     'height': 24, 'floor_height': 2, 'palette': {'body': 'ABCDEF'}})
+            child = self.worker.run_next()
+            spec = yaml.safe_load(self.store.blockout_file(child['id'], 'spec.yaml').read_bytes())
+            for section in ('plinth', 'tower'):
+                self.assertEqual(spec['massing'][section]['floor_height'], 2)
+                self.assertEqual(spec['massing'][section]['floors'], 6)
+            self.assertEqual(spec['massing']['tower']['location'], 'front_center')
+            self.assertEqual(spec['massing']['tower']['width'], 3)
+            self.assertEqual(child['generate']['blockout']['palette']['body']['hex'], 'abcdef')
+            self.assertEqual(child['generate']['blockout']['params']['height'], 24)
+            self.assertEqual(child['generate']['blockout']['confidence'], {})
+            self.assertEqual(child['generate']['blockout']['next_view'], '')
+            version = self.finish_generated(child)
+            self.edit_child(version, {'tower': {'enabled': False}, 'plinth_floors': 5})
+            next_child = self.worker.run_next()
+            self.assertIsNone(next_child['generate']['blockout']['params']['tower'])
+            self.assertEqual(next_child['generate']['blockout']['params']['height'], 10)
+            self.assertEqual(self.store.artifact_file('a', 'v', 1, 'blockout/spec.yaml').read_bytes(), original)
+
+    def test_edit_inherits_capture_only_parent_sources(self):
+        self.gl5_fakes()
+        from unittest.mock import Mock
+        path = self.root / 'cutout.png'; path.write_bytes(png(self.image))
+        self.http.app.state.store = Mock()
+        self.http.app.state.store.segment_file.return_value = path
+        response = self.http.post('/v1/forge/jobs', data={'asset': 'a', 'variant': 'v', 'intent': 'generate',
+            'params': json.dumps({'turntable': 1}), 'segment_refs': json.dumps([{'image_id': 'im1', 'segment_id': 's1'}])})
+        self.assertEqual(response.status_code, 201, response.text)
+        parent = self.finish_generated(self.worker.run_next())
+        child = self.edit_child(parent, {'height': 18})
+        self.assertEqual(child['inputs']['parent_uploads'], [])
+        child = self.worker.run_next()
+        self.assertEqual(child['match']['panels'][0]['panel_id'], 'c0-p0')
+        self.assertEqual(child['match']['panels'][0]['decision'], 'accept')
+        self.assertEqual(self.finish_generated(child)['lineage'], {'parent_version': 1, 'root_version': 1})
+
     def test_full_lifecycle_workspace_staging_spec_metrics_and_glb(self):
         job = self.reviewing()
         ws = self.worker.workspace_root(job)

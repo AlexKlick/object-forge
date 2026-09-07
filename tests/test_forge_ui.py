@@ -41,6 +41,19 @@ class ShellParser(HTMLParser):
 
 
 class ForgeUiTests(unittest.TestCase):
+    def test_edit_blockout_gating_form_and_inherited_review_sources(self):
+        source = (WEB / "forge.js").read_text()
+        self.assertIn('version.artifacts.includes("blockout/spec.yaml") ? button("Edit blockout", "edit-blockout"', source)
+        for token in ('editBlockout()', 'name="height"', 'name="floor_height"', 'name="plinth_floors"',
+                      'name="tower_enabled"', 'name="tower_width"', 'name="tower_location"',
+                      'value="rear_center"', 'value="front_center"', 'value="center"',
+                      'input.pattern = "[0-9a-fA-F]{6}"', 'input.oninput = preview',
+                      'body.append("intent", "iterate_blockout")', 'body.append("parent_job", version.job_id)',
+                      'body.append("parent_version", version.number)', 'body.append("edit", JSON.stringify(edit))',
+                      'form.remove(); showTab("forge"); board.card(job)', 'key: "parent_upload_index"',
+                      'upload.job_id || this.job.id', '["generate", "iterate_blockout"].includes(job.intent)'):
+            self.assertIn(token, source)
+
     def test_generate_board_blockout_review_and_cutout_sources(self):
         source = (WEB / "forge.js").read_text()
         for token in ("Generate blockout from photos", "generateToggle", "generateHeightHint", "generateFloorHeight",

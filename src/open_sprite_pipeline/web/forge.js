@@ -247,7 +247,7 @@ class BoardView {
     }
     card.job = job;
     const blockoutRoot = $(".forge-blockout-review", card.root);
-    blockoutRoot.hidden = job.intent !== "generate" || job.state !== "review" || !job.generate?.blockout;
+    blockoutRoot.hidden = !["generate", "iterate_blockout"].includes(job.intent) || job.state !== "review" || !job.generate?.blockout;
     const revision = `${job.generate?.regenerations}:${job.state}:${!!job.match.submitted}`;
     if (card.revision !== revision) {
       card.review = null;
@@ -322,6 +322,10 @@ class BlockoutReview {
     render();
     $("[data-action=previous]", root).onclick = () => { index = (index + blockout.views.length - 1) % blockout.views.length; render(); };
     $("[data-action=next]", root).onclick = () => { index = (index + 1) % blockout.views.length; render(); };
+    if (job.intent === "iterate_blockout") {
+      $("fieldset", root).remove();
+      return;
+    }
     const regenerate = $("[data-action=regenerate]", root);
     regenerate.disabled = !!job.match.submitted || job.generate.regenerations >= 8;
     regenerate.onclick = guard(async () => {
@@ -379,6 +383,7 @@ class MatchReview {
 
   async loadSheets() {
     const sources = [
+      ...(this.job.inputs?.parent_uploads || []).map((index) => ({ index, filename: `Parent photo ${index + 1}`, job_id: this.job.parent_job, route: `uploads/${index}`, key: "parent_upload_index" })),
       ...this.job.uploads.map((upload) => ({ ...upload, route: `uploads/${upload.index}`, key: "upload_index" })),
       ...(this.job.generate?.segment_refs || []).map((ref, index) => ({ index, filename: `Capture cutout ${index + 1}`, route: `cutouts/${index}.png`, key: "cutout_index" })),
     ];
@@ -391,7 +396,7 @@ class MatchReview {
       const sheet = { canvas, image, panels }; this.sheets.push(sheet);
       image.onload = () => { canvas.width = image.naturalWidth; canvas.height = image.naturalHeight; this.drawSheets(); };
       image.onerror = () => { toast(`Could not load ${upload.filename}`, true); };
-      image.src = `${forge}/jobs/${this.job.id}/${upload.route}`;
+      image.src = `${forge}/jobs/${upload.job_id || this.job.id}/${upload.route}`;
       canvas.onclick = (event) => {
         const bounds = canvas.getBoundingClientRect();
         const x = (event.clientX - bounds.left) * canvas.width / bounds.width;
@@ -507,7 +512,7 @@ class LibraryView {
 class VersionDetail {
   constructor(root) {
     this.root = root; this.loading = Promise.resolve(); this.request = 0;
-    root.innerHTML = `<div class="forge-heading"><h2 class="detail-title"></h2>${button("Close detail", "close")}</div><div class="detail-actions button-row"></div><div class="forge-detail-grid"><div><div class="mesh-viewer forge-viewer"></div><p class="detail-viewer-status" role="status"></p><div class="detail-layers"></div></div><div><div class="detail-filmstrip"></div><nav class="forge-subtabs" aria-label="Version detail tabs">${["Bake report", "Views", "History", "Critic"].map((name) => button(name, name)).join("")}</nav><div class="detail-content"></div></div></div><form class="detail-note" hidden><label>Author<input name="author" class="text-control" value="owner" required maxlength="128"></label><label>Note<textarea name="text" class="text-control" required maxlength="10000"></textarea></label><button class="button primary">Save note</button></form><dialog class="forge-lightbox"><button type="button" class="button secondary">Close</button><img alt="Turntable frame"></dialog>`;
+    root.innerHTML = `<div class="forge-heading"><h2 class="detail-title"></h2>${button("Close detail", "close")}</div><div class="detail-actions button-row"></div><div class="forge-detail-grid"><div><div class="mesh-viewer forge-viewer"></div><p class="detail-viewer-status" role="status"></p><div class="detail-layers"></div></div><div><div class="detail-filmstrip"></div><nav class="forge-subtabs" aria-label="Version detail tabs">${["Bake report", "Views", "History", "Critic"].map((name) => button(name, name)).join("")}</nav><div class="detail-content"></div></div></div><div class="detail-blockout-edit"></div><form class="detail-note" hidden><label>Author<input name="author" class="text-control" value="owner" required maxlength="128"></label><label>Note<textarea name="text" class="text-control" required maxlength="10000"></textarea></label><button class="button primary">Save note</button></form><dialog class="forge-lightbox"><button type="button" class="button secondary">Close</button><img alt="Turntable frame"></dialog>`;
     $("[data-action=close]", root).onclick = () => { root.hidden = true; ++this.request; };
     $(".forge-lightbox button", root).onclick = () => $("dialog", root).close();
     $(".forge-subtabs", root).onclick = (event) => { const name = event.target.closest("[data-action]")?.dataset.action; if (name) this.tab(name); };
@@ -520,6 +525,74 @@ class VersionDetail {
         $("textarea", form).value = ""; form.hidden = true; await this.open(version); this.tab("History"); toast("Note saved.");
       } finally { submit.disabled = false; }
     });
+  }
+
+  editBlockout() {
+    const version = this.version;
+    const blockout = this.job.generate?.blockout;
+    if (!version.artifacts.includes("blockout/spec.yaml") || !blockout) throw new Error("Parent blockout is unavailable.");
+    const form = document.createElement("form");
+    form.innerHTML = `<h3>Edit blockout</h3><p>Only changed values are applied. All views will be matched and reviewed again.</p>
+      <div class="forge-fields">
+        <label>Height (m)<input name="height" class="text-control" type="number" min="1" max="300" step="any" required></label>
+        <label>Floor height (m)<input name="floor_height" class="text-control" type="number" min="1" max="10" step="any" required></label>
+        <label>Plinth floors<input name="plinth_floors" class="text-control" type="number" min="1" max="40" step="1" required></label>
+        <label class="forge-check"><input name="tower_enabled" type="checkbox">Tower enabled</label>
+        <label>Tower width (m)<input name="tower_width" class="text-control" type="number" min="0.01" max="300" step="any" required></label>
+        <label>Tower location<select name="tower_location" class="select-control"><option value="rear_center">Rear center</option><option value="front_center">Front center</option><option value="center">Center</option></select></label>
+      </div><div class="edit-palette forge-fields"></div><p class="edit-error" role="alert"></p>
+      <button class="button primary" type="submit">Create edited blockout</button> ${button("Cancel", "cancel-edit")}`;
+    const field = (name) => $(`[name=${name}]`, form);
+    const initial = { height: blockout.params.height, floor_height: blockout.params.plinth.floor_height,
+      plinth_floors: blockout.params.plinth.floors };
+    for (const [key, value] of Object.entries(initial)) field(key).value = value;
+    const tower = blockout.params.tower;
+    field("tower_enabled").checked = !!tower;
+    field("tower_width").value = tower?.width ?? blockout.params.footprint.width / 2;
+    field("tower_location").value = tower?.location ?? "rear_center";
+    const toggle = () => { for (const key of ["tower_width", "tower_location"]) field(key).disabled = !field("tower_enabled").checked; };
+    field("tower_enabled").onchange = toggle; toggle();
+    for (const [role, color] of Object.entries(blockout.palette)) {
+      const label = document.createElement("label"); label.textContent = `${role} hex `;
+      const input = document.createElement("input"); input.className = "text-control"; input.required = true;
+      input.pattern = "[0-9a-fA-F]{6}"; input.value = color.hex.replace(/^#/, ""); input.dataset.role = role;
+      const swatch = document.createElement("span"); swatch.textContent = "Preview";
+      const preview = () => { swatch.style.borderLeft = /^[0-9a-fA-F]{6}$/.test(input.value) ? `24px solid #${input.value}` : ""; };
+      input.oninput = preview; preview(); label.append(input, swatch); $(".edit-palette", form).append(label);
+    }
+    $("[data-action=cancel-edit]", form).onclick = () => form.remove();
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const submit = $("button[type=submit]", form); submit.disabled = true;
+      $(".edit-error", form).textContent = "";
+      try {
+        if (!form.reportValidity()) return;
+        const edit = {};
+        for (const [key, value] of Object.entries(initial)) if (Number(field(key).value) !== value) edit[key] = Number(field(key).value);
+        const enabled = field("tower_enabled").checked;
+        if (enabled !== !!tower || (enabled && (Number(field("tower_width").value) !== tower.width || field("tower_location").value !== tower.location))) {
+          edit.tower = enabled ? { enabled, width: Number(field("tower_width").value), location: field("tower_location").value } : { enabled };
+        }
+        const palette = {};
+        for (const input of form.querySelectorAll("[data-role]")) {
+          if (input.value.toLowerCase() !== blockout.palette[input.dataset.role].hex.replace(/^#/, "").toLowerCase()) palette[input.dataset.role] = input.value;
+        }
+        if (Object.keys(palette).length) edit.palette = palette;
+        if (!Object.keys(edit).length) throw new Error("Change at least one value.");
+        const body = new FormData();
+        body.append("asset", version.asset); body.append("variant", version.variant);
+        body.append("intent", "iterate_blockout"); body.append("parent_job", version.job_id);
+        body.append("parent_version", version.number); body.append("edit", JSON.stringify(edit));
+        body.append("params", JSON.stringify(this.job.params));
+        const job = await api(`${forge}/jobs`, { method: "POST", body });
+        form.remove(); showTab("forge"); board.card(job);
+        board.jobs.get(job.id).root.scrollIntoView({ behavior: "smooth" });
+        toast("Blockout edit created. Waiting for new renders and matches.");
+      } catch (error) { $(".edit-error", form).textContent = error.message; }
+      finally { submit.disabled = false; }
+    };
+    $(".detail-blockout-edit", this.root).replaceChildren(form);
+    field("height").focus();
   }
 
   async open(summary) {
@@ -537,14 +610,16 @@ class VersionDetail {
       chain.push(ancestor); seen.add(ancestor.number);
     }
     if (request !== this.request) return;
+    $(".detail-blockout-edit", this.root).replaceChildren();
     this.version = version; this.job = job; this.report = report; this.harmonize = harmonize; this.chain = chain;
     this.root.hidden = false;
     $(".detail-title", this.root).textContent = `${version.asset} / ${version.variant} · ${lineage(version)}`;
-    $(".detail-actions", this.root).innerHTML = button(version.accepted ? "★ Accepted · unstar" : "☆ Accept", "accept") + (version.origin === "trellis" ? "" : button("Iterate", "iterate", "accent")) + button("Add note", "note");
+    $(".detail-actions", this.root).innerHTML = button(version.accepted ? "★ Accepted · unstar" : "☆ Accept", "accept") + (version.origin === "trellis" ? "" : button("Iterate", "iterate", "accent")) + (version.artifacts.includes("blockout/spec.yaml") ? button("Edit blockout", "edit-blockout", "accent") : "") + button("Add note", "note");
     $(".detail-actions", this.root).onclick = guard(async (event) => {
       const action = event.target.closest("[data-action]")?.dataset.action;
       if (action === "accept") { await api(`${versionPath(version)}/accept`, json({ accepted: !version.accepted })); await this.open(version); await library.refresh(); }
       if (action === "iterate") await board.iterate(version);
+      if (action === "edit-blockout") this.editBlockout();
       if (action === "note") { $(".detail-note", this.root).hidden = false; $("textarea", this.root).focus(); }
     });
     const layers = $(".detail-layers", this.root);
