@@ -529,7 +529,8 @@ class ForgeWorker:
                    "--asset", job["asset"], "--variant", job["variant"]]
         # .get(): jobs recorded before a parameter existed carry no key for it.
         for key in ("atlas_tile", "turntable", "ownership_min", "view_iou_warn", "view_iou_fail", "selfcheck_min"):
-            if job["params"].get(key):
+            value = job["params"].get(key)
+            if value or (key == "selfcheck_min" and value is not None):
                 command.extend(["--" + key.replace("_", "-"), str(job["params"][key])])
         if self.generate_family(job):
             command.extend(["--assets-root", str(ws), "--spec", str(spec)])

@@ -21,3 +21,9 @@ build/
 /cuda-keyring_1.1-1_all.deb
 node_modules/
 /deploy/open-sprite-trellis2.env
+
+# Local credentials and provider overrides
+.env.*
+!.env.example
+*.pem
+*.key

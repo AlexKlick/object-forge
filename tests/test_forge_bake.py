@@ -491,6 +491,8 @@ class ForgeBakeTests(unittest.TestCase):
         with patch.dict(os.environ, {"FORGE_BAKE_CMD": "", "FORGE_BAKE_PYTHON": "/custom/python"}):
             self.assertIn("--selfcheck-min", self.worker.bake_command(job))
             self.assertEqual(self.worker.bake_command(job)[-2:], ["--selfcheck-min", "0.96"])
+            job["params"]["selfcheck_min"] = 0.0
+            self.assertEqual(self.worker.bake_command(job)[-2:], ["--selfcheck-min", "0.0"])
             del job["params"]["selfcheck_min"]
             self.assertNotIn("--selfcheck-min", self.worker.bake_command(job))
 

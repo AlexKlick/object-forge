@@ -1,4 +1,24 @@
-# Open Sprite Pipeline
+# Object Forge / Open Sprite Pipeline
+
+Object Forge adds a versioned asset workflow to Open Sprite Pipeline: capture
+import, authored specs, styling, review, unattended policies, set jobs, and
+Godot library export. The Python package remains `open-sprite-pipeline`.
+
+See [Bake Forge](docs/BAKE_FORGE.md), [styling](docs/STYLE_ENGINE.md), and
+[sets and export](docs/SETS.md) for the current implementation.
+
+**Publication status (2026-09-08):** this is development source. The core mock
+pipeline and repository tests run without model weights. The Forge host worker
+also requires a separately supplied asset toolkit via `FORGE_SPIKE_ASSETS`;
+that toolkit currently lives in the private Debt City repository and is not
+included here. Public users cannot yet reproduce the full Forge bake/export
+workflow from this repository alone. Historical runbooks contain the original
+operator's paths and evidence locations; configure your own paths, and treat
+those records as historical reports rather than fresh validation. Model
+weights, credentials, generated output stores, and private game assets are not
+part of this repository.
+
+## Open Sprite Pipeline
 
 A maintainable, commercially-oriented orchestration scaffold for turning 2D images into itemized 3D assets and photoreal sprite renders using **open-source backends only**.
 
