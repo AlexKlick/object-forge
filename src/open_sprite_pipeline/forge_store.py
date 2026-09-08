@@ -28,6 +28,8 @@ from uuid import uuid4
 DEFAULT_PARAMS = {
     "iou": 0.70, "margin": 0.05, "allow_extra": False, "ownership_min": 0.5,
     "view_iou_warn": 0.90, "view_iou_fail": None, "atlas_tile": 1024, "turntable": 8,
+    # bake.py --selfcheck-min: silhouette IoU floor; None keeps the tool's default (0.97).
+    "selfcheck_min": None,
 }
 STATES = ("uploaded", "matching", "review", "staged", "queued_bake", "baking", "ready")
 TRANSITIONS = {a: {b, "failed"} for a, b in zip(STATES, STATES[1:])}
@@ -455,7 +457,10 @@ class ForgeStore:
                     generate.update(spec_asset=asset, palette_only=plan["palette_only"])
                 else:
                     generate.update({k: pair[k] for k in ("height_hint", "floor_height") if k in pair})
-                job = self.create_job(asset, variant, {"turntable": pair["turntable"]},
+                # Only manifest-authored values reach the job; absent ones keep the
+                # Forge defaults (turntable 8 — the critic scores those frames).
+                params = {key: pair[key] for key in ("turntable", "selfcheck_min") if pair.get(key) is not None}
+                job = self.create_job(asset, variant, params,
                                       intent=plan["intent"], generate=generate, set_id=set_id)
                 launched.append({"asset": asset, "variant": variant, "job_id": job["id"]})
                 refs = (item["files"]["pairs"][key]["style"] if "style_refs" in pair else item["files"]["style"])
@@ -500,9 +505,9 @@ class ForgeStore:
         if not isinstance(params, dict) or set(params) - DEFAULT_PARAMS.keys():
             raise ForgeStoreError("Params must be an object containing supported parameter names.")
         values = {**DEFAULT_PARAMS, **params}
-        for key in ("iou", "margin", "ownership_min", "view_iou_warn", "view_iou_fail"):
+        for key in ("iou", "margin", "ownership_min", "view_iou_warn", "view_iou_fail", "selfcheck_min"):
             value = values[key]
-            if value is None and key == "view_iou_fail":
+            if value is None and key in ("view_iou_fail", "selfcheck_min"):
                 continue
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
                 raise ForgeStoreError(f"{key} must be a finite number between 0 and 1.")

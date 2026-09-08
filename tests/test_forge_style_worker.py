@@ -120,6 +120,31 @@ class StyleWorkerTests(unittest.TestCase):
         self.assertNotIn('attention', job)
         self.assertEqual(job['policy']['version'], version['policy'])
 
+    def test_style_checks_inherit_the_render_verdict(self):
+        # A roof view the camera frames off-centre fails style_check's `centered`
+        # rule in the render itself; candidates keep that alpha byte-for-byte, so
+        # the failure is inherited and must not escalate the review (set round
+        # finding: city_hall/public roof, 2026-09-07).
+        self.store.policy = Policy('enforce')
+        self.worker.style = FakeStyle(identity=False)
+        script = self.root / 'fake blockout.py'
+        script.write_text(script.read_text().replace('(400, 400, 1647, 1647)', '(400, 600, 1647, 1847)'))
+        created = self.create(style={'enabled': True, 'seeds_per_view': 2})
+        review = self.worker.run_next()
+        self.assertEqual(review['state'], 'review')
+        self.assertTrue(review['match']['submitted'], review.get('attention'))
+        self.assertEqual(review['match']['submitted_by'], 'policy')
+        self.assertNotIn('attention', review)
+        style_panels = [p for p in review['match']['panels'] if p.get('source') == 'style']
+        self.assertEqual(len(style_panels), 2 * len(review['canonical_views']))
+        for panel in style_panels:
+            self.assertEqual(panel['checks']['inherited'], ['centered'])
+            self.assertFalse(panel['checks']['render_pass'])
+            self.assertFalse(panel['checks']['rules']['centered']['pass'])
+            self.assertTrue(panel['checks']['pass'])
+        self.assertIn('STYLE-CHECK', json.dumps(self.store.get_job(created['id'])))
+        self.assertEqual(self.snapshot(), self.before, 'SPIKE TREE CHANGED')
+
     def test_enforce_identity_style_escalates_with_attention(self):
         self.store.policy = Policy('enforce')
         self.worker.style = FakeStyle(identity=True)

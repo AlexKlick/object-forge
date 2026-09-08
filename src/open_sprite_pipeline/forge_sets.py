@@ -95,11 +95,15 @@ def _parse(raw):
             ForgeStore._name(asset)
             ForgeStore._name(variant)
             seen.add((asset, variant))
+            # Unlike the scene lane (turntable default 0) an absent turntable stays
+            # None so the launch keeps the Forge default: the critic needs frames.
+            turntable = item.get("turntable")
             pairs.append({"asset": asset, "variant": variant,
-                          "turntable": int(item.get("turntable", 0)),
+                          "turntable": int(turntable) if turntable is not None else None,
                           "palette_only": bool(item.get("palette_only", palette_default)),
                           "selfcheck_min": item.get("selfcheck_min"), **_factory_pair(name, item)})
-            ForgeStore.validate_params({"turntable": pairs[-1]["turntable"]})
+            ForgeStore.validate_params({key: pairs[-1][key] for key in ("turntable", "selfcheck_min")
+                                        if pairs[-1][key] is not None})
 
     bindings = raw.get("bindings", [])
     if not isinstance(bindings, list):

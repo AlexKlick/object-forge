@@ -233,6 +233,17 @@ reference image, three seeds, `long_side=768` → working size 400×768:
 | `style_metrics` (repo B) | palette_drift 4.1–6.7, change 7.3–8.0 (identity 0, +6 tint 2.5) |
 | prompt (`style_prompt`, 42 words after the 44-word budget) | 68 CLIP tokens |
 
+**Inherited checks (set round, 2026-09-07).** `style_check`'s rules are
+alpha-only and every candidate keeps the render's alpha byte-for-byte, so a rule
+the render itself fails says nothing about the restyle: city_hall/public's roof
+view is framed off-centre by the camera (`centered`: center (1015,1196) vs
+(1024,1024)), both roof candidates failed the same rule, and the policy
+escalated the whole job. The worker now runs `check_png` on the render first;
+rules failing in both are recorded under `checks.inherited` (with
+`checks.render_pass`) and excluded from `checks.pass`, and the job log carries
+`STYLE-CHECK <view> inherits render failures: …`. A candidate that fails a rule
+the render passes still fails.
+
 Three real-load defects were found and fixed by this round before the first
 successful render: ControlNet needed `variant="fp16"` (cache holds fp16 only),
 diffusers 0.40 removed the pipeline-level VAE slicing wrappers, and attention

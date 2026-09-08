@@ -37,7 +37,8 @@ bindings:
         self.assertEqual(scene['description'], 'two buildings')
         self.assertEqual([(p['asset'], p['variant']) for p in scene['requires']],
                          [('bank_citadel', 'local'), ('bank_citadel', 'megabank'), ('kiosk', 'public')])
-        self.assertEqual([p['turntable'] for p in scene['requires']], [8, 8, 0])
+        # Absent turntable stays None: the launch keeps the Forge default (8), not the scene lane's 0.
+        self.assertEqual([p['turntable'] for p in scene['requires']], [8, 8, None])
         self.assertEqual(load_manifest(BASE)['name'], 'set')
         self.assertEqual(load_manifest('set: alias\n' + BASE)['name'], 'alias')
         self.assertFalse(scene['palette_only'])
@@ -74,7 +75,9 @@ bindings:
         for body in ('[', 'requires: [{asset: a, variant: v, turntable: nope}]',
                      BASE + 'props: [{asset: a, count: null}]',
                      BASE + 'props: [{asset: a, phase: 2026-09-07}]',
-                     'requires: [{asset: a, variant: v, selfcheck_min: .nan}]'):
+                     'requires: [{asset: a, variant: v, selfcheck_min: .nan}]',
+                     'requires: [{asset: a, variant: v, selfcheck_min: 1.5}]',
+                     'requires: [{asset: a, variant: v, turntable: -1}]'):
             with self.subTest(body=body), self.assertRaises(ForgeStoreError):
                 load_manifest(body)
 
@@ -237,6 +240,9 @@ requires:
         self.assertEqual(jobs['plain']['intent'], 'from_spec')
         self.assertTrue(jobs['plain']['generate']['palette_only'])
         self.assertIsNone(jobs['plain']['generate']['style'])
+        # No manifest turntable/selfcheck_min: the child keeps the Forge defaults.
+        self.assertEqual(jobs['plain']['params']['turntable'], 8)
+        self.assertIsNone(jobs['plain']['params']['selfcheck_min'])
         for variant, refs in (('hero', ['board.png']), ('own', ['own.png'])):
             self.assertFalse(jobs[variant]['generate']['palette_only'])
             self.assertTrue(jobs[variant]['generate']['style']['enabled'])
@@ -382,16 +388,17 @@ requires:
             response = self.http.post(f"/v1/forge/sets/{item['id']}/launch", json={'force': value})
             self.assertEqual(response.status_code, 422)
 
-    def test_generate_seven_sources_and_selfcheck_not_invented(self):
+    def test_generate_seven_sources_and_selfcheck_forwarded(self):
         # Seven is the synthesis worker's input ceiling; the manifest matches it.
         names = [f'{i}.png' for i in range(7)]
         manifest = yaml.safe_dump({'requires': [{'asset': 'new', 'variant': 'v', 'source': 'generate',
-                                                'sources': names, 'selfcheck_min': .96, 'turntable': 8}]})
+                                                'sources': names, 'selfcheck_min': .96, 'turntable': 4}]})
         item = self.create(manifest, [self.image('pair_sources[new/v][]', n) for n in names])
         job = self.store.get_job(self.launch(item)['launched'][0]['job_id'])
         self.assertEqual(len(job['uploads']), 7)
-        self.assertEqual(job['params']['turntable'], 8)
-        self.assertNotIn('selfcheck_min', job['params'])
+        self.assertEqual(job['params']['turntable'], 4)
+        # The scene lane's selfcheck floor reaches bake.py through the job params.
+        self.assertEqual(job['params']['selfcheck_min'], .96)
 
     def test_multipart_limits_and_bad_files_leave_no_record(self):
         cases = [([self.image('style[]', f'{i}.png') for i in range(65)], BASE),

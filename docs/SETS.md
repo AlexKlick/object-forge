@@ -19,8 +19,8 @@ style:
 requires:
   - asset: bank
     variants: [local, public]        # scalar variants or singular variant also work
-    turntable: 8                    # default 0
-    selfcheck_min: 0.96              # retained; unsupported by Forge params today
+    turntable: 8                    # absent → the Forge default (8; the critic needs frames)
+    selfcheck_min: 0.96              # forwarded to bake.py --selfcheck-min (job params)
   - asset: kiosk
     variant: local
     style: true                     # explicit override of hero membership
@@ -97,9 +97,15 @@ while those children are live creates no jobs.
 Spec pairs without a matching published catalog asset are skipped with
 `no spec in catalog` and reported as blocked. An absent/empty catalog blocks spec
 pairs as well. Generate pairs have no authored spec to look up. Publishing the
-missing catalog spec permits a later normal launch. Only `turntable` is
-forwarded from the current manifest to job params; `selfcheck_min` is retained
-without inventing an unsupported job parameter.
+missing catalog spec permits a later normal launch. `turntable` and
+`selfcheck_min` are forwarded to the child job's params only when the manifest
+sets them; an absent value keeps the Forge default. This differs from the scene
+lane on purpose: its turntable default is 0, but the Forge critic scores the
+turntable frames, and a version without them is `critic: skipped` and therefore
+never auto-accepted under `FORGE_POLICY=enforce` (the first live set round
+flagged 15 of 15 new versions that way). `selfcheck_min` reaches
+`bake.py --selfcheck-min`, so a prop like the streetlight (roof view 0.9679
+against the 0.97 default floor) bakes with the floor its manifest declares.
 
 Retry is launch without force, restricted to pairs whose latest child is failed
 or has attention. Live children, including those awaiting review, are never

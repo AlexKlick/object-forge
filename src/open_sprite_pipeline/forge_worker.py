@@ -527,8 +527,9 @@ class ForgeWorker:
         command = [os.getenv("FORGE_BAKE_PYTHON", "/home/alexk/.venv/bin/python"),
                    str(checked_path(self.assets, "tools/bake.py")),
                    "--asset", job["asset"], "--variant", job["variant"]]
-        for key in ("atlas_tile", "turntable", "ownership_min", "view_iou_warn", "view_iou_fail"):
-            if job["params"][key]:
+        # .get(): jobs recorded before a parameter existed carry no key for it.
+        for key in ("atlas_tile", "turntable", "ownership_min", "view_iou_warn", "view_iou_fail", "selfcheck_min"):
+            if job["params"].get(key):
                 command.extend(["--" + key.replace("_", "-"), str(job["params"][key])])
         if self.generate_family(job):
             command.extend(["--assets-root", str(ws), "--spec", str(spec)])
@@ -814,6 +815,14 @@ class ForgeWorker:
             size = (init.width // 2, init.height // 2)
             small_init = init.resize(size, Image.Resampling.LANCZOS)
             small_alpha = init.getchannel("A").resize(size, Image.Resampling.NEAREST)
+            # style_check's rules are alpha-only and every candidate keeps the render's
+            # alpha byte-for-byte, so a rule the render itself fails (a roof view framed
+            # off-centre by the camera) says nothing about the restyle. Those failures
+            # are inherited, recorded, and excluded from the candidate's verdict.
+            render_checks = self.style_check.check_png(init_path)
+            inherited = {name for name, rule in render_checks.get("rules", {}).items() if not rule.get("pass")}
+            if inherited:
+                self.progress(job, f"STYLE-CHECK {view} inherits render failures: {' '.join(sorted(inherited))}")
             scored = {}
             for candidate in candidates:
                 seed = candidate["seed"]
@@ -828,6 +837,10 @@ class ForgeWorker:
                 path.write_bytes(data)
                 metrics = self.style_metrics.evaluate(small, small_init, small_alpha)
                 checks = self.style_check.check_png(path)
+                failed = {name for name, rule in checks.get("rules", {}).items() if not rule.get("pass")}
+                checks["inherited"] = sorted(failed & inherited)
+                checks["render_pass"] = bool(render_checks.get("pass"))
+                checks["pass"] = bool(checks.get("pass")) or not (failed - inherited)
                 scored[seed] = {"metrics": metrics, "checks": checks}
                 self.client.request("POST", base + f"/style/{view}/{seed}.png", data, lease=lease)
             chosen = max(seeds, key=lambda seed: (scored[seed]["metrics"]["pass"],

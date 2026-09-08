@@ -482,8 +482,17 @@ class ForgeBakeTests(unittest.TestCase):
         self.assertEqual(command[:2], ["/custom/python", str(self.assets / "tools/bake.py")])
         self.assertNotIn("--turntable", command)
         self.assertNotIn("--view-iou-fail", command)
+        self.assertNotIn("--selfcheck-min", command)
         self.assertIn("--atlas-tile", command)
         self.assertEqual(self.worker.bake_command(job), shlex.split(os.environ["FORGE_BAKE_CMD"]))
+        # A manifest/job selfcheck floor reaches bake.py; jobs recorded before the
+        # parameter existed carry no key and must still build a command.
+        job["params"]["selfcheck_min"] = 0.96
+        with patch.dict(os.environ, {"FORGE_BAKE_CMD": "", "FORGE_BAKE_PYTHON": "/custom/python"}):
+            self.assertIn("--selfcheck-min", self.worker.bake_command(job))
+            self.assertEqual(self.worker.bake_command(job)[-2:], ["--selfcheck-min", "0.96"])
+            del job["params"]["selfcheck_min"]
+            self.assertNotIn("--selfcheck-min", self.worker.bake_command(job))
 
     def test_interrupt_reaps_bake_before_restoration(self):
         job = self.approve(self.staged())
